@@ -1,0 +1,2 @@
+{"step": 1, "loss": 39.933539, "avg_loss": 39.933539, "lr": 0.0, "grad_norm": 1.0, "elapsed_s": 5.38}
+{"step": 5, "loss": 33.273203, "avg_loss": 3.555733, "lr": 2.3999999999999997e-05, "grad_norm": 1.0, "elapsed_s": 27.16}
