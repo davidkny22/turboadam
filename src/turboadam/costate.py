@@ -153,7 +153,7 @@ def _pack_signs(values: torch.Tensor) -> torch.Tensor:
     sign_bits = (values < 0).to(torch.uint8)  # 1 if negative
     sign_bits = sign_bits.reshape(-1, 8)  # (num_bytes, 8)
     # Pack: bit 7 is index 0, bit 0 is index 7
-    multipliers = torch.tensor([128, 64, 32, 16, 8, 4, 2, 1], dtype=torch.uint8)
+    multipliers = torch.tensor([128, 64, 32, 16, 8, 4, 2, 1], dtype=torch.uint8, device=sign_bits.device)
     packed = (sign_bits * multipliers).sum(dim=1).to(torch.uint8)
     return packed
 
@@ -168,8 +168,11 @@ def _unpack_signs(packed: torch.Tensor, n: int) -> torch.Tensor:
     Returns:
         float32 tensor of length n with values +1 or -1.
     """
-    # Ensure uint8 (PyTorch load_state_dict _cast may change dtype)
-    packed_int = packed.to(torch.uint8).to(torch.int32)
+    # Ensure uint8 (PyTorch load_state_dict _cast may change dtype).
+    # Bit-shift operations are performed on CPU because MPS does not support
+    # integer bitwise ops; results are moved to the original device afterward.
+    orig_device = packed.device
+    packed_int = packed.to(torch.uint8).cpu().to(torch.int32)
     # Extract 8 bits per byte (bit 7 first)
     bits = torch.zeros(packed.shape[0] * 8, dtype=torch.float32)
     for i, shift in enumerate([7, 6, 5, 4, 3, 2, 1, 0]):
@@ -178,7 +181,7 @@ def _unpack_signs(packed: torch.Tensor, n: int) -> torch.Tensor:
     bits = bits[:n]  # trim to original length
     # Convert: 1 -> -1, 0 -> +1
     signs = 1.0 - 2.0 * bits
-    return signs
+    return signs.to(orig_device)
 
 
 def encode_blocks(
@@ -271,8 +274,8 @@ def decode_blocks(
     signs_padded, _ = pad_to_blocks(signs_flat, block_size)
     signs_blocks = signs_padded.reshape(num_blocks, block_size)
 
-    # Build delta_hat block by block
-    delta_hat_padded = torch.zeros(num_blocks * block_size, dtype=torch.float32)
+    # Build delta_hat block by block (keep on same device as g)
+    delta_hat_padded = torch.zeros(num_blocks * block_size, dtype=torch.float32, device=g_flat.device)
     delta_hat_blocks = delta_hat_padded.reshape(num_blocks, block_size)
 
     for i in range(num_blocks):
