@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# OS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Experiment outputs (generated, not tracked)
+experiments/results/
+experiments/checkpoints/
+
+# Internal docs (live on disk only, not committed per project rules)
+CLAUDE.md
+TASK.md
+docs/research/
+docs/specs/
+docs/superpowers/
+
+# pytest
+.pytest_cache/
+
+# Local CUDA/Triton verification caches
+.tmp/
+.triton_cache/
