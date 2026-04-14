@@ -197,7 +197,9 @@ def encode_blocks(
             labels      (uint8)  : costate label per block
             sign_packed (uint8)  : packed sign bits, ceil(numel/8) bytes
             block_norms (float32): L2 norm of each delta block
-            scales      (float16): per-block scale (block norm as fp16)
+            scales      (float16): per-block amplitude scale = block_norm / sqrt(block_size),
+                                   stored as fp16.  This is the uniform per-element magnitude
+                                   that sign-only reconstruction (amplitude costate) uses.
     """
     delta_flat = delta.reshape(-1).float()
     original_numel = delta_flat.shape[0]
@@ -209,8 +211,12 @@ def encode_blocks(
     # Per-block L2 norms
     block_norms = delta_blocks.norm(dim=1).float()  # (num_blocks,)
 
-    # Per-block fp16 scales (same as block norms but in fp16)
-    scales = block_norms.to(torch.float16)  # (num_blocks,)
+    # Per-block fp16 amplitude scales: block_norm / sqrt(block_size).
+    # Storing the per-element uniform magnitude (rather than the block L2 norm) means
+    # amplitude decode is: scale * sign(delta_block), yielding the correct element magnitudes.
+    # Phase decode computes the same value on the fly from block_norms; amplitude stores it
+    # explicitly in fp16 so the scale is preserved with full fp16 precision.
+    scales = (block_norms / math.sqrt(block_size)).to(torch.float16)  # (num_blocks,)
 
     # Pack sign bits for the original (un-padded) elements
     sign_packed = _pack_signs(delta_flat)
@@ -288,3 +294,76 @@ def decode_blocks(
     # Reconstruct m
     result = alpha * g_flat + delta_hat
     return result.reshape(g.shape)
+
+
+# ---------------------------------------------------------------------------
+# CoStateManager — stateful per-step update loop (spec section 4.5)
+# ---------------------------------------------------------------------------
+
+class CoStateManager:
+    """Stateful manager for CoState first moment compression.
+
+    Implements the per-step update procedure from spec section 4.5:
+      1. Load compressed δ̂ and costate bitmap from memory (if prior state exists)
+      2. Reconstruct m̃ = α · g + decompress(δ̂)   [skip on first call, use m̃ = 0]
+      3. Compute EMA update: m_new = β₁ · m̃ + (1 - β₁) · g
+      4. Compute new projection: α_new = (m_new · g) / (g · g)
+      5. Compute new residual: δ_new = m_new - α_new · g
+      6. Classify blocks into costates using adaptive thresholds
+      7. Compress and store δ̂_new according to costate assignments
+      8. Store updated costate bitmap and α_new
+
+    Usage:
+        mgr = CoStateManager(block_size=128)
+        m = mgr.update(g, beta1=0.9)  # call each optimizer step
+    """
+
+    def __init__(self, block_size: int = BLOCK_SIZE) -> None:
+        self.block_size = block_size
+        self._has_state: bool = False
+        self._alpha: float = 0.0
+        self._encoded: dict | None = None
+        self._original_numel: int = 0
+
+    def update(self, g: torch.Tensor, beta1: float) -> torch.Tensor:
+        """Run one step of the CoState update procedure.
+
+        Args:
+            g:     Current gradient tensor (any shape).
+            beta1: EMA decay for first moment (e.g. 0.9).
+
+        Returns:
+            m_new: Updated first moment tensor, same shape as g.
+        """
+        # Step 1-2: Reconstruct m̃ from compressed prior state (or zeros on first call)
+        if self._has_state:
+            m_hat = decode_blocks(
+                self._encoded,
+                self._alpha,
+                g,
+                self.block_size,
+                self._original_numel,
+            )
+        else:
+            m_hat = torch.zeros_like(g)
+
+        # Step 3: EMA update
+        m_new = beta1 * m_hat + (1.0 - beta1) * g
+
+        # Steps 4-5: Decompose m_new relative to current g
+        alpha_new, delta_new = decompose(m_new, g)
+
+        # Step 6: Classify blocks using adaptive thresholds
+        ratios = compute_block_ratios(delta_new, m_new, self.block_size)
+        tau0, tau1 = compute_thresholds(ratios)
+        labels = classify_blocks(ratios, tau0, tau1)
+
+        # Steps 7-8: Compress and store
+        encoded_new = encode_blocks(delta_new, labels, self.block_size)
+
+        self._alpha = alpha_new
+        self._encoded = encoded_new
+        self._original_numel = m_new.numel()
+        self._has_state = True
+
+        return m_new
