@@ -26,12 +26,20 @@ def is_matrix_param(param: torch.Tensor) -> bool:
     return param.ndim >= 2 and param.numel() > MATRIX_NUMEL_THRESHOLD
 
 
-def pad_to_blocks(tensor: torch.Tensor, block_size: int = BLOCK_SIZE) -> tuple[torch.Tensor, int]:
-    """Pad a flat 1-D tensor with zeros to the next multiple of block_size.
+def pad_to_blocks(
+    tensor: torch.Tensor,
+    block_size: int = BLOCK_SIZE,
+    pad_value: float = 0.0,
+) -> tuple[torch.Tensor, int]:
+    """Pad a flat 1-D tensor to the next multiple of block_size.
 
     Args:
         tensor:     1-D tensor to pad.
         block_size: Block alignment target (default: BLOCK_SIZE = 128).
+        pad_value:  Value to fill the padding with (default: 0.0).
+                    For log-scale quantization of positive tensors, callers
+                    should pass the tensor minimum to avoid polluting block
+                    statistics with log(-inf) from zero padding.
 
     Returns:
         (padded_tensor, original_length) where padded_tensor.shape[0] is a
@@ -42,7 +50,8 @@ def pad_to_blocks(tensor: torch.Tensor, block_size: int = BLOCK_SIZE) -> tuple[t
     if remainder == 0:
         return tensor, original_length
     pad_size = block_size - remainder
-    padded = torch.cat([tensor, tensor.new_zeros(pad_size)])
+    fill = tensor.new_full((pad_size,), pad_value)
+    padded = torch.cat([tensor, fill])
     return padded, original_length
 
 

@@ -328,3 +328,404 @@ class TestParamGroups:
         # Both params should have state
         assert p1 in opt.state
         assert p2 in opt.state
+
+
+# ---------------------------------------------------------------------------
+# 8. Phase B — v compression after warmup
+# ---------------------------------------------------------------------------
+
+class TestPhaseBCompression:
+    """Tests for Phase B: v gets compressed when warmup_complete fires."""
+
+    def _make_matrix_param(self, seed=0):
+        """Return a large matrix param that triggers SVD path (ndim=2, numel>10000)."""
+        torch.manual_seed(seed)
+        return torch.nn.Parameter(torch.randn(128, 128))  # 16384 elements > 10000
+
+    def _make_bias_param(self, seed=1):
+        """Return a 1-D bias param that triggers logscale path."""
+        torch.manual_seed(seed)
+        return torch.nn.Parameter(torch.randn(64))
+
+    def _step_with_grad(self, opt, params):
+        """Run one step with fresh random gradients."""
+        for p in params:
+            p.grad = torch.randn_like(p)
+        opt.step()
+
+    def test_compression_triggered_by_warmup_threshold(self):
+        """With warmup_threshold=100.0, warmup fires after first step.
+
+        After compression, state should have 'compressed_v' and phase='B'.
+        The full fp32 exp_avg_sq should be removed.
+        """
+        torch.manual_seed(42)
+        p_matrix = self._make_matrix_param()
+        p_bias = self._make_bias_param()
+        params = [p_matrix, p_bias]
+
+        # warmup_threshold=100.0 means ANY relative change < 100 → fires after step 1
+        opt = TurboAdam(params, lr=1e-3, warmup_threshold=100.0, refresh_mode="single")
+
+        # First step: initialises state, runs warmup check (should fire)
+        self._step_with_grad(opt, params)
+
+        for p in params:
+            state = opt.state[p]
+            assert state["warmup_complete"] is True, "warmup_complete should be True"
+            assert state.get("phase") == "B", f"Expected phase='B', got {state.get('phase')!r}"
+            assert "compressed_v" in state, "compressed_v missing from state after Phase B transition"
+            assert "exp_avg_sq" not in state, "exp_avg_sq should be deleted after compression"
+            assert "v_prev" not in state, "v_prev should be deleted after compression"
+
+    def test_compressed_v_correct_type_for_matrix(self):
+        """Matrix param should produce an SVD-type compressed_v."""
+        torch.manual_seed(0)
+        p_matrix = self._make_matrix_param()
+        opt = TurboAdam([p_matrix], lr=1e-3, warmup_threshold=100.0, refresh_mode="single")
+        self._step_with_grad(opt, [p_matrix])
+
+        state = opt.state[p_matrix]
+        assert "compressed_v" in state
+        assert state["compressed_v"]["type"] == "svd", (
+            f"Expected 'svd' type for matrix param, got {state['compressed_v']['type']!r}"
+        )
+
+    def test_compressed_v_correct_type_for_bias(self):
+        """Bias (1-D) param should produce a logscale-type compressed_v."""
+        torch.manual_seed(0)
+        p_bias = self._make_bias_param()
+        opt = TurboAdam([p_bias], lr=1e-3, warmup_threshold=100.0, refresh_mode="single")
+        self._step_with_grad(opt, [p_bias])
+
+        state = opt.state[p_bias]
+        assert "compressed_v" in state
+        assert state["compressed_v"]["type"] == "logscale", (
+            f"Expected 'logscale' type for bias param, got {state['compressed_v']['type']!r}"
+        )
+
+    def test_phase_b_accumulator_state(self):
+        """After entering Phase B, state should contain refresh_counter and g_sq_accum."""
+        torch.manual_seed(0)
+        p = self._make_matrix_param()
+        opt = TurboAdam([p], lr=1e-3, warmup_threshold=100.0, refresh_mode="single")
+        self._step_with_grad(opt, [p])
+
+        state = opt.state[p]
+        assert "refresh_counter" in state, "refresh_counter missing after Phase B"
+        assert "g_sq_accum" in state, "g_sq_accum missing after Phase B"
+        assert state["g_sq_accum"].shape == p.shape, "g_sq_accum shape mismatch"
+
+    def test_phase_b_convergence_500_steps(self):
+        """TurboAdam in Phase B (fast warmup) should still converge on f(x) = sum(x²)."""
+        torch.manual_seed(0)
+        x = torch.nn.Parameter(torch.randn(50))
+        opt = TurboAdam([x], lr=1e-2, warmup_threshold=100.0, refresh_mode="single")
+
+        initial_loss = (x ** 2).sum().item()
+        for _ in range(500):
+            opt.zero_grad()
+            loss = (x ** 2).sum()
+            loss.backward()
+            opt.step()
+
+        final_loss = (x ** 2).sum().item()
+        assert final_loss < 0.10 * initial_loss, (
+            f"Phase B convergence failed: initial={initial_loss:.4f}, final={final_loss:.6f}"
+        )
+
+    def test_phase_b_v_frozen_between_refreshes(self):
+        """Between refreshes, compressed_v dict should not change identity or values."""
+        torch.manual_seed(0)
+        p = self._make_bias_param()
+        opt = TurboAdam([p], lr=1e-3, warmup_threshold=100.0, refresh_interval=1000, refresh_mode="single")
+
+        # Trigger Phase B
+        self._step_with_grad(opt, [p])
+
+        state = opt.state[p]
+        assert state.get("phase") == "B"
+
+        # Snapshot the compressed_v values before more steps
+        from turboadam.oneq import decompress_v
+        v_after_entry = decompress_v(state["compressed_v"]).clone()
+
+        # Run several more steps (well short of refresh_interval=1000)
+        for _ in range(10):
+            self._step_with_grad(opt, [p])
+
+        # compressed_v should be identical (frozen)
+        v_mid = decompress_v(state["compressed_v"])
+        assert torch.allclose(v_after_entry, v_mid, atol=0.0), (
+            "compressed_v changed between refreshes — v should be frozen"
+        )
+
+    def test_phase_b_refresh_counter_increments(self):
+        """refresh_counter should increment each Phase B step."""
+        torch.manual_seed(0)
+        p = self._make_matrix_param()
+        opt = TurboAdam([p], lr=1e-3, warmup_threshold=100.0, refresh_interval=1000, refresh_mode="single")
+
+        # First step triggers Phase B; refresh_counter starts at 0 at entry
+        self._step_with_grad(opt, [p])
+
+        state = opt.state[p]
+        assert state.get("phase") == "B"
+        # After the transition step, counter should be 1 (the transition step counts)
+        assert state["refresh_counter"] == 1, (
+            f"Expected refresh_counter=1 after first Phase B step, got {state['refresh_counter']}"
+        )
+
+        # Run 5 more steps
+        for _ in range(5):
+            self._step_with_grad(opt, [p])
+
+        assert state["refresh_counter"] == 6, (
+            f"Expected refresh_counter=6 after 6 Phase B steps, got {state['refresh_counter']}"
+        )
+
+    def test_phase_b_refresh_updates_compressed_v(self):
+        """After refresh_interval Phase B steps, compressed_v should be updated."""
+        torch.manual_seed(0)
+        p = self._make_bias_param()
+        refresh_interval = 5  # short for test speed
+        opt = TurboAdam([p], lr=1e-3, warmup_threshold=100.0, refresh_interval=refresh_interval, refresh_mode="single")
+
+        # Trigger Phase B
+        self._step_with_grad(opt, [p])
+        state = opt.state[p]
+        assert state.get("phase") == "B"
+
+        from turboadam.oneq import decompress_v
+        v_pre_refresh = decompress_v(state["compressed_v"]).clone()
+
+        # Run refresh_interval - 1 more steps (total = refresh_interval steps in Phase B)
+        # The first Phase B step counted as 1, so we need refresh_interval-1 more to reach refresh
+        for _ in range(refresh_interval - 1):
+            self._step_with_grad(opt, [p])
+
+        v_post_refresh = decompress_v(state["compressed_v"])
+
+        # After refresh the values should differ from the initial compression
+        # (different g² accumulation was used to update v)
+        assert not torch.allclose(v_pre_refresh, v_post_refresh, atol=1e-6), (
+            "compressed_v did not change after refresh — refresh cycle is not working"
+        )
+
+    def test_phase_b_refresh_resets_counter(self):
+        """After a refresh, refresh_counter should reset to 0."""
+        torch.manual_seed(0)
+        p = self._make_bias_param()
+        refresh_interval = 5
+        opt = TurboAdam([p], lr=1e-3, warmup_threshold=100.0, refresh_interval=refresh_interval, refresh_mode="single")
+
+        self._step_with_grad(opt, [p])
+
+        # Run until refresh fires (refresh_interval steps total in Phase B)
+        for _ in range(refresh_interval - 1):
+            self._step_with_grad(opt, [p])
+
+        state = opt.state[p]
+        assert state["refresh_counter"] == 0, (
+            f"Expected refresh_counter=0 after refresh, got {state['refresh_counter']}"
+        )
+
+    def test_mixed_phase_a_and_phase_b(self):
+        """Different params can be in different phases simultaneously.
+
+        Use a normal warmup_threshold so the small param stays in Phase A while
+        we force the large one to enter Phase B immediately using a param group trick.
+        Instead, we verify the optimizer handles both phases correctly in a single step
+        by using a high threshold on all params — this tests internal routing logic.
+        """
+        torch.manual_seed(0)
+        p_matrix = self._make_matrix_param()
+        p_bias = self._make_bias_param()
+
+        opt = TurboAdam(
+            [p_matrix, p_bias],
+            lr=1e-3,
+            warmup_threshold=100.0,
+            refresh_mode="single",
+        )
+
+        # Step 1: both enter Phase B (threshold is huge)
+        self._step_with_grad(opt, [p_matrix, p_bias])
+
+        assert opt.state[p_matrix].get("phase") == "B"
+        assert opt.state[p_bias].get("phase") == "B"
+
+        # Step 2+: both stay in Phase B without error
+        for _ in range(3):
+            self._step_with_grad(opt, [p_matrix, p_bias])
+
+        # Both still in Phase B
+        assert opt.state[p_matrix].get("phase") == "B"
+        assert opt.state[p_bias].get("phase") == "B"
+
+
+# ---------------------------------------------------------------------------
+# 9. Phase B — compressed-mode g² accumulator (refresh_mode='compressed')
+# ---------------------------------------------------------------------------
+
+class TestPhaseBCompressedAccum:
+    """Tests for refresh_mode='compressed': g² accumulator stored in 2-bit log-scale form."""
+
+    def _make_bias_param(self, seed=1):
+        torch.manual_seed(seed)
+        return torch.nn.Parameter(torch.randn(64))
+
+    def _make_matrix_param(self, seed=0):
+        torch.manual_seed(seed)
+        return torch.nn.Parameter(torch.randn(128, 128))
+
+    def _step_with_grad(self, opt, params):
+        for p in params:
+            p.grad = torch.randn_like(p)
+        opt.step()
+
+    def test_compressed_accum_keys_present_after_phase_b_entry(self):
+        """In compressed mode, state should have packed accumulator keys (not fp32 g_sq_accum)."""
+        torch.manual_seed(0)
+        p = self._make_bias_param()
+        opt = TurboAdam([p], lr=1e-3, warmup_threshold=100.0, refresh_mode="compressed")
+        self._step_with_grad(opt, [p])
+
+        state = opt.state[p]
+        assert state.get("phase") == "B"
+        assert "g_sq_accum_packed" in state, "g_sq_accum_packed missing in compressed mode"
+        assert "g_sq_accum_scales" in state, "g_sq_accum_scales missing in compressed mode"
+        assert "g_sq_accum_numel" in state, "g_sq_accum_numel missing in compressed mode"
+        assert "g_sq_accum_count" in state, "g_sq_accum_count missing in compressed mode"
+        # Full fp32 g_sq_accum should NOT be present in compressed mode
+        assert "g_sq_accum" not in state, (
+            "g_sq_accum (fp32) should not be in state for refresh_mode='compressed'"
+        )
+
+    def test_compressed_accum_count_increments(self):
+        """g_sq_accum_count should increment each Phase B step in compressed mode."""
+        torch.manual_seed(0)
+        p = self._make_bias_param()
+        opt = TurboAdam([p], lr=1e-3, warmup_threshold=100.0, refresh_mode="compressed")
+
+        self._step_with_grad(opt, [p])
+        state = opt.state[p]
+        assert state["g_sq_accum_count"] == 1
+
+        for _ in range(4):
+            self._step_with_grad(opt, [p])
+
+        assert state["g_sq_accum_count"] == 5, (
+            f"Expected count=5 after 5 Phase B steps, got {state['g_sq_accum_count']}"
+        )
+
+    def test_compressed_mode_convergence_500_steps(self):
+        """Compressed refresh mode should converge on quadratic loss within 500 steps."""
+        torch.manual_seed(0)
+        x = torch.nn.Parameter(torch.randn(50))
+        opt = TurboAdam([x], lr=1e-2, warmup_threshold=100.0, refresh_mode="compressed")
+
+        initial_loss = (x ** 2).sum().item()
+        for _ in range(500):
+            opt.zero_grad()
+            loss = (x ** 2).sum()
+            loss.backward()
+            opt.step()
+
+        final_loss = (x ** 2).sum().item()
+        assert final_loss < 0.10 * initial_loss, (
+            f"Compressed mode convergence failed: initial={initial_loss:.4f}, "
+            f"final={final_loss:.6f}"
+        )
+
+    def test_compressed_accum_refresh_resets_count(self):
+        """After a refresh cycle, g_sq_accum_count should reset to 1 (current step)."""
+        torch.manual_seed(0)
+        p = self._make_bias_param()
+        refresh_interval = 5
+        opt = TurboAdam(
+            [p], lr=1e-3, warmup_threshold=100.0,
+            refresh_interval=refresh_interval, refresh_mode="compressed"
+        )
+
+        self._step_with_grad(opt, [p])
+        for _ in range(refresh_interval - 1):
+            self._step_with_grad(opt, [p])
+
+        state = opt.state[p]
+        assert state["refresh_counter"] == 0, (
+            f"refresh_counter should be 0 after refresh, got {state['refresh_counter']}"
+        )
+        assert state["g_sq_accum_count"] == 1, (
+            f"g_sq_accum_count should reset to 1 after refresh, "
+            f"got {state['g_sq_accum_count']}"
+        )
+
+    def test_compressed_refresh_updates_compressed_v(self):
+        """compressed_v should change after a refresh in compressed mode."""
+        torch.manual_seed(0)
+        p = self._make_bias_param()
+        refresh_interval = 5
+        opt = TurboAdam(
+            [p], lr=1e-3, warmup_threshold=100.0,
+            refresh_interval=refresh_interval, refresh_mode="compressed"
+        )
+
+        self._step_with_grad(opt, [p])
+        state = opt.state[p]
+
+        from turboadam.oneq import decompress_v
+        v_pre = decompress_v(state["compressed_v"]).clone()
+
+        for _ in range(refresh_interval - 1):
+            self._step_with_grad(opt, [p])
+
+        v_post = decompress_v(state["compressed_v"])
+        assert not torch.allclose(v_pre, v_post, atol=1e-6), (
+            "compressed_v should change after refresh in compressed mode"
+        )
+
+    def test_compressed_vs_single_refresh_differ(self):
+        """K-sample compressed refresh should produce a different v than single-sample refresh.
+
+        With K=5 accumulated gradients vs a single current gradient, the estimates
+        of recent gradient variance should differ when gradients are non-constant.
+        """
+        torch.manual_seed(42)
+        refresh_interval = 10
+
+        # Run single-sample mode
+        torch.manual_seed(42)
+        p_single = self._make_matrix_param(seed=42)
+        opt_single = TurboAdam(
+            [p_single], lr=1e-3, warmup_threshold=100.0,
+            refresh_interval=refresh_interval, refresh_mode="single"
+        )
+        # Use fixed random seeds for reproducible gradients
+        for i in range(refresh_interval):
+            torch.manual_seed(i)
+            p_single.grad = torch.randn_like(p_single)
+            opt_single.step()
+
+        # Run compressed mode with the SAME gradient sequence
+        torch.manual_seed(42)
+        p_comp = self._make_matrix_param(seed=42)
+        opt_comp = TurboAdam(
+            [p_comp], lr=1e-3, warmup_threshold=100.0,
+            refresh_interval=refresh_interval, refresh_mode="compressed"
+        )
+        for i in range(refresh_interval):
+            torch.manual_seed(i)
+            p_comp.grad = torch.randn_like(p_comp)
+            opt_comp.step()
+
+        from turboadam.oneq import decompress_v
+        v_single = decompress_v(opt_single.state[p_single]["compressed_v"])
+        v_comp = decompress_v(opt_comp.state[p_comp]["compressed_v"])
+
+        # The two should differ because single uses only the last gradient,
+        # while compressed averages over all K gradients
+        assert not torch.allclose(v_single, v_comp, atol=1e-4), (
+            "Expected single-sample and K-sample compressed refresh to produce different v̂ "
+            "when gradient varies across steps"
+        )

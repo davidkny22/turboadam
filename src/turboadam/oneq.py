@@ -104,7 +104,12 @@ def _compress_logscale(
     """Compress v via 2-bit log-scale block quantization."""
     original_shape = v.shape
     v_flat = v.reshape(-1).float()
-    v_padded, original_length = pad_to_blocks(v_flat, block_size)
+    # Pad with the minimum value so the partial-block padding does not
+    # inject log(-inf) = -87.5 into the block statistics, which would
+    # collapse all bucket boundaries toward the padding value.
+    v_min = v_flat.min().item()
+    pad_value = max(v_min, 1e-38)  # guard against exact-zero v_flat
+    v_padded, original_length = pad_to_blocks(v_flat, block_size, pad_value=pad_value)
     packed, scales = quantize_logscale(v_padded, block_size=block_size)
     return {
         "type": "logscale",
