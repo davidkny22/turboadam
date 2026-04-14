@@ -91,6 +91,9 @@ def dequantize_logscale(
     if original_numel == 0:
         original_numel = num_blocks * block_size
 
+    # Ensure packed is uint8 (PyTorch load_state_dict _cast may change dtype)
+    packed = packed.to(torch.uint8)
+
     # Unpack 4 x 2-bit indices from each byte
     idx0 = (packed & 0x03).to(torch.long)
     idx1 = ((packed >> 2) & 0x03).to(torch.long)

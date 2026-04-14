@@ -79,6 +79,23 @@ class TurboAdam(Optimizer):
         )
         super().__init__(params, defaults)
 
+        # PyTorch's load_state_dict _cast() corrupts string values inside
+        # nested dicts (treats strings as iterables → generator objects).
+        # Fix the 'type' field in compressed_v after loading.
+        def _fix_compressed_type(optimizer, *args, **kwargs):
+            for state in optimizer.state.values():
+                for key in ("compressed_v",):
+                    if key in state and isinstance(state[key], dict):
+                        t = state[key].get("type")
+                        if t is not None and not isinstance(t, str):
+                            # Reconstruct from the generator or other mangled form
+                            try:
+                                state[key]["type"] = "".join(t)
+                            except TypeError:
+                                pass
+
+        self.register_load_state_dict_post_hook(_fix_compressed_type)
+
     # ------------------------------------------------------------------
     # Internal helpers for the compressed g² accumulator
     # ------------------------------------------------------------------
@@ -199,7 +216,10 @@ class TurboAdam(Optimizer):
                 bias_correction1 = 1.0 - beta1 ** step
                 bias_correction2 = 1.0 - beta2 ** step
 
-                if state["phase"] == "A":
+                # Dispatch on structural keys: 'compressed_v' exists only in Phase B.
+                # Avoids reliance on string 'phase' which PyTorch _cast corrupts.
+                in_phase_a = "compressed_v" not in state
+                if in_phase_a:
                     # -------------------------------------------------------
                     # Phase A: full fp32 v update (standard Adam EMA)
                     # -------------------------------------------------------

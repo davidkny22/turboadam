@@ -729,3 +729,105 @@ class TestPhaseBCompressedAccum:
             "Expected single-sample and K-sample compressed refresh to produce different v̂ "
             "when gradient varies across steps"
         )
+
+
+# ---------------------------------------------------------------------------
+# 10. State dict save/load roundtrip
+# ---------------------------------------------------------------------------
+
+class TestStateDictRoundtrip:
+    """Verify state_dict save/load preserves all custom state."""
+
+    def test_phase_a_roundtrip(self):
+        """Save/load during Phase A — loss continues decreasing after reload."""
+        torch.manual_seed(0)
+        x = nn.Parameter(torch.randn(50))
+        opt = TurboAdam([x], lr=1e-2)
+
+        # Run 50 steps
+        for _ in range(50):
+            opt.zero_grad()
+            loss = (x ** 2).sum()
+            loss.backward()
+            opt.step()
+        loss_before_save = (x ** 2).sum().item()
+
+        # Save and reload
+        sd = opt.state_dict()
+        opt2 = TurboAdam([x], lr=1e-2)
+        opt2.load_state_dict(sd)
+
+        # Run 50 more steps
+        for _ in range(50):
+            opt2.zero_grad()
+            loss = (x ** 2).sum()
+            loss.backward()
+            opt2.step()
+        loss_after_reload = (x ** 2).sum().item()
+
+        assert loss_after_reload < loss_before_save, (
+            f"Loss should decrease after reload: before={loss_before_save:.6f}, "
+            f"after={loss_after_reload:.6f}"
+        )
+
+    def test_phase_b_roundtrip(self):
+        """Save/load during Phase B — compressed v and CoState survive."""
+        torch.manual_seed(0)
+        x = nn.Parameter(torch.randn(50))
+        opt = TurboAdam([x], lr=1e-2, warmup_threshold=100.0)
+
+        # Run 50 steps (enters Phase B immediately)
+        for _ in range(50):
+            opt.zero_grad()
+            loss = (x ** 2).sum()
+            loss.backward()
+            opt.step()
+        loss_before_save = (x ** 2).sum().item()
+
+        # Save and reload
+        sd = opt.state_dict()
+        opt2 = TurboAdam([x], lr=1e-2, warmup_threshold=100.0)
+        opt2.load_state_dict(sd)
+
+        # Run 50 more steps
+        for _ in range(50):
+            opt2.zero_grad()
+            loss = (x ** 2).sum()
+            loss.backward()
+            opt2.step()
+        loss_after_reload = (x ** 2).sum().item()
+
+        assert loss_after_reload < loss_before_save, (
+            f"Loss should decrease after Phase B reload: before={loss_before_save:.6f}, "
+            f"after={loss_after_reload:.6f}"
+        )
+
+    def test_state_dict_file_roundtrip(self):
+        """Save to file via torch.save, load back, continue training."""
+        import tempfile, os
+        torch.manual_seed(0)
+        x = nn.Parameter(torch.randn(50))
+        opt = TurboAdam([x], lr=1e-2, warmup_threshold=100.0)
+
+        for _ in range(30):
+            opt.zero_grad()
+            loss = (x ** 2).sum()
+            loss.backward()
+            opt.step()
+
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+            torch.save(opt.state_dict(), f.name)
+            tmp_path = f.name
+
+        try:
+            loaded_sd = torch.load(tmp_path, weights_only=False)
+            opt2 = TurboAdam([x], lr=1e-2, warmup_threshold=100.0)
+            opt2.load_state_dict(loaded_sd)
+
+            # Should not raise
+            opt2.zero_grad()
+            loss = (x ** 2).sum()
+            loss.backward()
+            opt2.step()
+        finally:
+            os.unlink(tmp_path)

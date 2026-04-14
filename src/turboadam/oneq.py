@@ -175,12 +175,14 @@ def decompress_v(compressed: dict) -> torch.Tensor:
     Returns:
         fp32 tensor with the same shape as the original v.
     """
-    if compressed["type"] == "svd":
+    # Dispatch on structural keys rather than the 'type' string, because
+    # PyTorch's load_state_dict _cast() corrupts strings inside nested dicts.
+    if "U" in compressed:
         return _decompress_svd(compressed)
-    elif compressed["type"] == "logscale":
+    elif "packed" in compressed:
         return _decompress_logscale(compressed)
     else:
-        raise ValueError(f"Unknown compressed type: {compressed['type']!r}")
+        raise ValueError(f"Cannot determine compressed type from keys: {list(compressed.keys())}")
 
 
 def refresh_v(

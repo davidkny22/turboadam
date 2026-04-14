@@ -168,7 +168,8 @@ def _unpack_signs(packed: torch.Tensor, n: int) -> torch.Tensor:
     Returns:
         float32 tensor of length n with values +1 or -1.
     """
-    packed_int = packed.to(torch.int32)
+    # Ensure uint8 (PyTorch load_state_dict _cast may change dtype)
+    packed_int = packed.to(torch.uint8).to(torch.int32)
     # Extract 8 bits per byte (bit 7 first)
     bits = torch.zeros(packed.shape[0] * 8, dtype=torch.float32)
     for i, shift in enumerate([7, 6, 5, 4, 3, 2, 1, 0]):
@@ -257,7 +258,7 @@ def decode_blocks(
     if original_numel is None:
         original_numel = g_flat.shape[0]
 
-    labels = encoded["labels"]         # (num_blocks,)
+    labels = encoded["labels"].to(torch.uint8)  # (num_blocks,) — guard against _cast
     sign_packed = encoded["sign_packed"]
     block_norms = encoded["block_norms"].float()  # (num_blocks,)
     scales = encoded["scales"].to(torch.float32)  # (num_blocks,)
