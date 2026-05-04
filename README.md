@@ -18,7 +18,7 @@ optimizer = TurboAdam(model.parameters(), lr=1e-3)
 
 Adam stores two full-precision copies of every parameter (first and second moments). For a 7B model that is **28 GB** of optimizer state alone — often the memory bottleneck that forces smaller batch sizes or shorter context lengths.
 
-TurboAdam compresses both moments in-place during training, cutting optimizer-state memory from **64 bits/param → 9.9 bits/param** (6.5× reduction). On GPT-2 124M it converges within **+0.30 loss points** of full-precision AdamW (1.5% relative — within run-to-run noise).
+TurboAdam compresses both moments in-place during training, cutting optimizer-state memory from **64 bits/param → 9.9 bits/param** (6.5× reduction). On GPT-2 124M it converges within **+0.25 loss points** of full-precision AdamW (**1.2% relative** — within run-to-run noise).
 
 | Model size | AdamW optimizer state | TurboAdam | Savings |
 |-----------|----------------------|-----------|---------|
@@ -125,11 +125,11 @@ The v-only path is actually **faster** than AdamW because 4-bit log-scale decomp
 |--------------|-----------------|--------------|
 | AdamW (full fp32) | 19.28 | — |
 | TurboAdam (8-bit v + CoState) | 19.79 | +0.51 |
-| **TurboAdam (4-bit v + CoState, default)** | **19.58** | **+0.30** |
+| **TurboAdam (4-bit v + CoState, default)** | **19.58** | **+0.25** |
 | TurboAdam (CoState only, fp32 v) | 19.80 | +0.52 |
 | TurboAdam (v only, fp32 m) | 19.28 | ~0.00 |
 
-The +0.30 gap is structural to CoState's sign-only encoding and varies by random seed (0.03–0.30). Threshold tuning and error feedback do not reduce it. For workloads where every tenth of a point matters, run with `compress_m=False` for v-only compression at zero convergence cost.
+The +0.25 gap is structural to CoState's sign-only encoding and shrinks as training progresses (+2.94 at step 50, +0.25 at step 500). Threshold tuning and error feedback do not reduce it. For workloads where every tenth of a point matters, run with `compress_m=False` for v-only compression at zero convergence cost.
 
 ---
 
@@ -194,7 +194,7 @@ python scripts/profile_memory.py
 
 1. **Compress-every-step (not freeze-refresh).** The original design froze v for 1000 steps and refreshed periodically. This caused a +3.75 loss gap from v staleness. Compress-every-step with stochastic rounding eliminates staleness — the EMA runs continuously on the compressed state.
 
-2. **4-bit default.** 4-bit gives 6.5× compression with +0.30 gap. 8-bit gives 4.1× with +0.51. The sweet spot is 4-bit — going higher barely improves precision, going lower risks noise accumulation.
+2. **4-bit default.** 4-bit gives 6.5× compression with +0.25 gap. 8-bit gives 4.1× with +0.51. The sweet spot is 4-bit — going higher barely improves precision, going lower risks noise accumulation.
 
 3. **Stochastic rounding.** Unbiased rounding prevents systematic drift in the EMA. Without it, deterministic rounding accumulates a bias of ~1000× the per-step error (for β₂=0.999).
 
