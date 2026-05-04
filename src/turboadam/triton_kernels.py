@@ -74,10 +74,13 @@ def _fused_v_update_kernel(
         # EMA
         v_new = beta2 * v_old + one_minus_beta2 * g_sq
 
-        # Recompress
+        # Recompress — mask padded elements out of block min/max so partial
+        # blocks don't have their statistics corrupted by padding values.
         log_v_new = tl.log(tl.maximum(v_new, 1e-38))
-        new_log_min = tl.min(log_v_new, axis=0)
-        new_log_max = tl.max(log_v_new, axis=0)
+        log_v_for_min = tl.where(mask, log_v_new, 1e38)
+        log_v_for_max = tl.where(mask, log_v_new, -1e38)
+        new_log_min = tl.min(log_v_for_min, axis=0)
+        new_log_max = tl.max(log_v_for_max, axis=0)
         new_span = tl.maximum(new_log_max - new_log_min, 1e-10)
         normalized = (log_v_new - new_log_min) / new_span
         continuous = normalized * n_buckets
@@ -133,8 +136,8 @@ def triton_fused_v_update(
     if rand_buf is None:
         rand_buf = torch.rand(padded_numel, dtype=torch.float32, device=grad.device)
 
-    # Flatten gradient for kernel access
-    grad_flat = grad.reshape(-1).contiguous()
+    # Flatten gradient for kernel access (cast to fp32 for numerical stability)
+    grad_flat = grad.reshape(-1).float().contiguous()
 
     # Limit grid size: cap at ~2048 programs, each processes multiple blocks
     max_programs = 2048

@@ -370,13 +370,21 @@ class TestVCompression:
 
     def test_v_bits_parameter(self):
         """Different v_bits values should work."""
-        for bits in [4, 6, 8, 10]:
+        for bits in [2, 3, 4, 6, 8]:
             torch.manual_seed(0)
             params = _make_params()
             opt = TurboAdam(params, v_bits=bits)
             _step_with_grad(opt, params)
             v = decompress_v(opt.state[params[0]]["compressed_v"])
             assert v.shape == params[0].shape
+
+    def test_v_bits_invalid_rejected(self):
+        """Invalid v_bits values should raise ValueError."""
+        params = _make_params()
+        with pytest.raises(ValueError, match="v_bits must be one of"):
+            TurboAdam(params, v_bits=10)
+        with pytest.raises(ValueError, match="v_bits must be one of"):
+            TurboAdam(params, v_bits=16)
 
     def test_convergence_at_various_bits(self):
         """Should converge on quadratic at 4, 6, and 8 bits (within 500 steps)."""

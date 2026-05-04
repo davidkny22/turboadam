@@ -262,9 +262,14 @@ def fused_v_update(
     v_blocks.mul_(beta2).add_(g_sq_blocks, alpha=1.0 - beta2)
 
     # --- Recompress (quantize in-place, already in block layout) ---
+    # Mask padded elements out of block min/max so partial blocks keep
+    # correct statistics.
     log_blocks = v_blocks.clamp(min=1e-38).log()
-    new_log_min = log_blocks.min(dim=1).values
-    new_log_max = log_blocks.max(dim=1).values
+    block_indices = torch.arange(num_blocks, device=v_blocks.device).unsqueeze(1)
+    elem_indices = torch.arange(block_size, device=v_blocks.device).unsqueeze(0)
+    valid_mask = (block_indices * block_size + elem_indices) < original_numel
+    new_log_min = log_blocks.masked_fill(~valid_mask, float('inf')).min(dim=1).values
+    new_log_max = log_blocks.masked_fill(~valid_mask, float('-inf')).max(dim=1).values
     new_scales = torch.stack([new_log_min, new_log_max], dim=1).to(torch.float16)
 
     new_span = (new_log_max - new_log_min).unsqueeze(1).clamp(min=1e-10)

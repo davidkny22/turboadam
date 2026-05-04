@@ -35,7 +35,7 @@ class TurboAdam(Optimizer):
         eps: Numerical stability term. Default: 1e-8.
         weight_decay: L2 penalty. Default: 0.
         block_size: Quantization block size (elements). Default: 128.
-        v_bits: Bits per element for v compression (4, 6, 8, or 16). Default: 4.
+        v_bits: Bits per element for v compression (2, 3, 4, 6, or 8). Default: 4.
         compress_m: Enable CoState m compression. Default: True.
         compress_v: Enable v compression. Default: True.
     """
@@ -55,6 +55,8 @@ class TurboAdam(Optimizer):
         amp_pct: float = 0.90,
         error_feedback: bool = False,
     ):
+        if v_bits not in (2, 3, 4, 6, 8):
+            raise ValueError(f"v_bits must be one of {{2, 3, 4, 6, 8}}, got {v_bits}")
         defaults = dict(
             lr=lr,
             betas=betas,
@@ -112,9 +114,13 @@ class TurboAdam(Optimizer):
                     cv = state["compressed_v"]
                     _v_update_fn = _triton_v_update if (_HAS_TRITON and grad.is_cuda) else fused_v_update
                     if _HAS_TRITON and grad.is_cuda:
+                        # Refill random buffer for stochastic rounding (graph-safe:
+                        # same tensor address, only contents change)
+                        cv["rand_buf"].uniform_()
                         new_indices, new_scales, v_flat = _v_update_fn(
                             cv["indices"], cv["scales"], grad, beta2,
                             cv["n_bits"], cv["block_size"], cv["original_length"],
+                            rand_buf=cv["rand_buf"],
                             out_indices=cv["indices"],
                             out_scales=cv["scales"],
                         )
@@ -139,20 +145,25 @@ class TurboAdam(Optimizer):
         """Update per-parameter scalar tensors for the next optimizer step."""
         for group_idx, group in enumerate(self.param_groups):
             beta1, beta2 = group["betas"]
-            scalar_state = None
             next_step = None
+            # Find the step count from the first param with state in this group
             for p in group["params"]:
                 if p.grad is None or p not in self.state:
                     continue
-                state = self.state[p]
-                scalar_state = state
-                next_step = state["step"] + 1  # step increments inside _full_step_kernel
+                next_step = self.state[p]["step"] + 1  # step increments inside _full_step_kernel
                 break
-            if scalar_state is None:
+            if next_step is None:
                 continue
-            scalar_state["_bc1"].fill_(1.0 - beta1 ** next_step)
-            scalar_state["_bc2"].fill_(1.0 - beta2 ** next_step)
-            scalar_state["_step_seed"].fill_((next_step * 1103515245 + group_idx) & 0x7FFFFFFF)
+            bc1_val = 1.0 - beta1 ** next_step
+            bc2_val = 1.0 - beta2 ** next_step
+            # Update ALL params in this group so save/load state_dict remains correct
+            # (each param gets its own copy of the scalars on load)
+            for p in group["params"]:
+                if p not in self.state:
+                    continue
+                state = self.state[p]
+                state["_bc1"].fill_(bc1_val)
+                state["_bc2"].fill_(bc2_val)
 
     # ------------------------------------------------------------------
     # Main step
@@ -205,13 +216,19 @@ class TurboAdam(Optimizer):
                     state["_bc2"] = group_tensors["bc2"]
                     state["_step_seed"] = group_tensors["step_seed"]
 
-                # First step: init compressed_v with zeros so _step_kernel
+                # First step: init compressed_v with near-zero so _step_kernel
                 # can do the real first EMA update (avoids double-counting g²)
                 if use_compress_v and "compressed_v" not in state:
                     v = torch.full_like(p, 1e-30, dtype=torch.float32)
                     state["compressed_v"] = compress_v_logscale(
                         v, n_bits=v_bits, block_size=block_size, stochastic_round=False,
                     )
+                    if _HAS_TRITON and p.is_cuda:
+                        num_blocks = state["compressed_v"]["scales"].shape[0]
+                        padded_numel = num_blocks * block_size
+                        state["compressed_v"]["rand_buf"] = torch.empty(
+                            padded_numel, dtype=torch.float32, device=p.device
+                        )
 
         # Prepare bias corrections for this step
         self._prepare_step_scalars()

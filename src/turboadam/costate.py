@@ -351,7 +351,6 @@ class CoStateManager:
         self._threshold_interval = threshold_interval
         self._cached_tau: tuple | None = None
         self._step_count: int = 0
-        self._m_new: torch.Tensor | None = None
         self._error_feedback = error_feedback
         self._ef_residual: torch.Tensor | None = None
 
@@ -389,7 +388,7 @@ class CoStateManager:
                 self._original_numel,
             )
         else:
-            m_hat = torch.zeros_like(g)
+            m_hat = torch.zeros_like(g, dtype=torch.float32)
 
         # Error feedback: compensate for previous step's encoding loss
         if self._error_feedback and self._ef_residual is not None:
