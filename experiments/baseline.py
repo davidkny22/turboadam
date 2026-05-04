@@ -14,7 +14,6 @@ import time
 import torch
 import torch.nn as nn
 
-from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -35,6 +34,8 @@ def parse_args():
     p.add_argument("--output_dir",  type=str,   default="experiments/results", help="Directory for log output")
     p.add_argument("--log_every",   type=int,   default=50,         help="Log interval (steps)")
     p.add_argument("--dry_run",     action="store_true",            help="Run 5 steps only (smoke test)")
+    p.add_argument("--cache_path",  type=str,   default=None,       help="Path to pre-tokenized .pt chunk list (skips HF download)")
+    p.add_argument("--no_amp",      action="store_true",            help="Disable AMP mixed precision")
     return p.parse_args()
 
 
@@ -68,31 +69,11 @@ def get_lr(step: int, warmup_steps: int, total_steps: int, peak_lr: float) -> fl
 # Dataset construction
 # ---------------------------------------------------------------------------
 
-def build_token_chunks(tokenizer, seq_len: int, split: str = "train"):
-    """Stream WikiText-103, tokenize, concat, chunk into seq_len+1 windows."""
-    print(f"Loading WikiText-103 ({split})…")
-    dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split=split)
-
-    # Tokenize each article (no padding/truncation — we'll handle manually)
-    token_ids = []
-    for sample in dataset:
-        text = sample["text"].strip()
-        if not text:
-            continue
-        ids = tokenizer.encode(text, add_special_tokens=False, truncation=False)
-        token_ids.extend(ids)
-        token_ids.append(tokenizer.eos_token_id)  # article boundary
-
-    print(f"  Total tokens: {len(token_ids):,}")
-
-    # Slice into (seq_len + 1) chunks: input = [:-1], target = [1:]
-    chunks = []
-    for i in range(0, len(token_ids) - seq_len, seq_len):
-        chunk = token_ids[i : i + seq_len + 1]
-        if len(chunk) == seq_len + 1:
-            chunks.append(chunk)
-
-    print(f"  Total chunks: {len(chunks):,}")
+def load_chunks(cache_path: str) -> list:
+    """Load pre-tokenized chunks from a .pt file (list of 512-token tensors)."""
+    print(f"Loading tokenized cache from {cache_path}…")
+    chunks = torch.load(cache_path, weights_only=False)
+    print(f"  Chunks: {len(chunks):,}  seq_len: {chunks[0].shape[0]}")
     return chunks
 
 
@@ -104,8 +85,8 @@ class ChunkDataset(torch.utils.data.Dataset):
         return len(self.chunks)
 
     def __getitem__(self, idx):
-        chunk = torch.tensor(self.chunks[idx], dtype=torch.long)
-        return chunk[:-1], chunk[1:]  # input, target
+        chunk = self.chunks[idx].long()
+        return chunk[:-1], chunk[1:]  # input (511), target (511)
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +119,7 @@ def main():
     device = select_device(args.device)
     print(f"Device: {device}")
 
-    use_amp = (device.type == "cuda")
+    use_amp = (device.type == "cuda") and not getattr(args, 'no_amp', False)
     # MPS and CPU run in native precision
     print(f"Mixed precision (AMP): {use_amp}")
 
@@ -165,7 +146,28 @@ def main():
     # -----------------------------------------------------------------------
     # Dataset / DataLoader
     # -----------------------------------------------------------------------
-    chunks = build_token_chunks(tokenizer, args.seq_len, split="train")
+    if args.cache_path:
+        chunks = load_chunks(args.cache_path)
+    else:
+        from datasets import load_dataset
+        print("No --cache_path provided, streaming WikiText-103 from HuggingFace…")
+        def _build_token_chunks(tokenizer, seq_len, split="train"):
+            dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split=split)
+            token_ids = []
+            for sample in dataset:
+                text = sample["text"].strip()
+                if not text:
+                    continue
+                ids = tokenizer.encode(text, add_special_tokens=False, truncation=False)
+                token_ids.extend(ids)
+                token_ids.append(tokenizer.eos_token_id)
+            chunks = []
+            for i in range(0, len(token_ids) - seq_len, seq_len):
+                chunk = token_ids[i : i + seq_len + 1]
+                if len(chunk) == seq_len + 1:
+                    chunks.append(torch.tensor(chunk, dtype=torch.long))
+            return chunks
+        chunks = _build_token_chunks(tokenizer, args.seq_len)
     dataset = ChunkDataset(chunks)
     loader = torch.utils.data.DataLoader(
         dataset,

@@ -1,13 +1,13 @@
 """Ablation sweep script for TurboAdam hyperparameter sensitivity.
 
 Runs shortened training loops with configurable mode and hyperparameters.
-Supports: 1Q-only, CoState-only, combined, and baseline modes.
+Supports: baseline, combined, m-only, v-only, and no-compression modes.
 Logs to parameterized JSONL filenames for batch analysis.
 
 Usage:
-    python experiments/ablation.py --mode combined --block_size 128 --steps 500
+    python experiments/ablation.py --mode combined --v_bits 4 --steps 500
     python experiments/ablation.py --mode baseline --steps 500
-    python experiments/ablation.py --mode 1q_only --svd_rank 16 --steps 500
+    python experiments/ablation.py --mode costate_only --null_pct 0.05 --steps 500
 """
 
 import argparse
@@ -27,17 +27,18 @@ def parse_args():
     p = argparse.ArgumentParser(description="TurboAdam ablation sweep")
     # Mode
     p.add_argument("--mode", type=str, default="combined",
-                   choices=["baseline", "1q_only", "costate_only", "combined"],
+                   choices=["baseline", "combined", "costate_only", "1q_only", "no_compression"],
                    help="Optimizer mode")
     # TurboAdam hyperparameters
     p.add_argument("--block_size", type=int, default=128)
-    p.add_argument("--svd_rank", type=int, default=8)
-    p.add_argument("--refresh_interval", type=int, default=1000)
-    p.add_argument("--warmup_fraction", type=float, default=0.15,
-                   help="Fraction of steps for v warmup (sets warmup_threshold accordingly)")
-    p.add_argument("--warmup_threshold", type=float, default=0.01)
-    p.add_argument("--refresh_mode", type=str, default="compressed",
-                   choices=["single", "compressed"])
+    p.add_argument("--v_bits", type=int, default=4,
+                   help="Bits for v compression: 4, 6, 8, or 16")
+    p.add_argument("--null_pct", type=float, default=0.10,
+                   help="CoState null threshold percentile")
+    p.add_argument("--amp_pct", type=float, default=0.90,
+                   help="CoState amplitude threshold percentile")
+    p.add_argument("--error_feedback", action="store_true",
+                   help="Enable CoState error feedback")
     # Training
     p.add_argument("--steps", type=int, default=500)
     p.add_argument("--batch_size", type=int, default=4)
@@ -118,31 +119,40 @@ def make_optimizer(mode, model, args):
 
     from turboadam import TurboAdam
 
-    # For 1q_only and costate_only, we still use TurboAdam but could
-    # configure to disable one technique. For now, the modes are:
-    # - combined: both 1Q + CoState (default TurboAdam)
-    # - 1q_only: TurboAdam with very aggressive warmup (CoState still runs
-    #   but its impact is the full system minus the motivation to separate)
-    # - costate_only: TurboAdam with warmup_threshold=0 (v never compresses)
     if mode == "costate_only":
-        # v never compresses — stays fp32. CoState-m is active.
         return TurboAdam(
             model.parameters(), lr=args.lr,
             betas=(0.9, 0.999), weight_decay=0.01, eps=1e-8,
             block_size=args.block_size,
-            warmup_threshold=0.0,  # v never stabilizes → stays Phase A
-            refresh_mode=args.refresh_mode,
+            compress_m=True, compress_v=False,
+            null_pct=args.null_pct, amp_pct=args.amp_pct,
+            error_feedback=args.error_feedback,
+        )
+    elif mode == "1q_only":
+        return TurboAdam(
+            model.parameters(), lr=args.lr,
+            betas=(0.9, 0.999), weight_decay=0.01, eps=1e-8,
+            block_size=args.block_size,
+            compress_m=False, compress_v=True,
+            v_bits=args.v_bits,
+        )
+    elif mode == "no_compression":
+        return TurboAdam(
+            model.parameters(), lr=args.lr,
+            betas=(0.9, 0.999), weight_decay=0.01, eps=1e-8,
+            block_size=args.block_size,
+            compress_m=False, compress_v=False,
         )
     else:
-        # combined or 1q_only (both use full TurboAdam)
+        # combined (default)
         return TurboAdam(
             model.parameters(), lr=args.lr,
             betas=(0.9, 0.999), weight_decay=0.01, eps=1e-8,
             block_size=args.block_size,
-            svd_rank=args.svd_rank,
-            refresh_interval=args.refresh_interval,
-            warmup_threshold=args.warmup_threshold,
-            refresh_mode=args.refresh_mode,
+            v_bits=args.v_bits,
+            compress_m=True, compress_v=True,
+            null_pct=args.null_pct, amp_pct=args.amp_pct,
+            error_feedback=args.error_feedback,
         )
 
 
@@ -156,8 +166,8 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Parameterized log filename
-    tag = (f"ablation_{args.mode}_bs{args.block_size}_r{args.svd_rank}"
-           f"_K{args.refresh_interval}_wt{args.warmup_threshold}")
+    tag = (f"ablation_{args.mode}_bs{args.block_size}_vb{args.v_bits}"
+           f"_np{args.null_pct}_ap{args.amp_pct}")
     log_path = os.path.join(args.output_dir, f"{tag}.jsonl")
     print(f"Mode: {args.mode} | Log: {log_path}")
 

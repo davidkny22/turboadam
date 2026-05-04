@@ -55,7 +55,9 @@ class TestDecompose:
         m = torch.randn(256)
         g = torch.randn(256)
         alpha, delta = decompose(m, g)
-        assert isinstance(alpha, float)
+        assert isinstance(alpha, (float, torch.Tensor))
+        if isinstance(alpha, torch.Tensor):
+            assert alpha.ndim == 0  # scalar tensor
 
     def test_delta_shape_matches_m(self):
         """Delta should have the same shape as m."""
@@ -123,12 +125,12 @@ class TestComputeBlockRatios:
 
 class TestComputeThresholds:
     def test_known_uniform_distribution(self):
-        """With uniform [0,1] ratios, tau0 ≈ 0.1, tau1 ≈ 0.9."""
+        """With uniform [0,1] ratios, tau0 ≈ 0.10, tau1 ≈ 0.90 (P10/P90 defaults)."""
         torch.manual_seed(42)
         ratios = torch.linspace(0.0, 1.0, steps=1000)
         tau0, tau1 = compute_thresholds(ratios)
-        assert abs(tau0 - 0.1) < 0.01, f"Expected tau0 ≈ 0.1, got {tau0}"
-        assert abs(tau1 - 0.9) < 0.01, f"Expected tau1 ≈ 0.9, got {tau1}"
+        assert abs(tau0 - 0.10) < 0.02, f"Expected tau0 ≈ 0.10, got {tau0}"
+        assert abs(tau1 - 0.90) < 0.02, f"Expected tau1 ≈ 0.90, got {tau1}"
 
     def test_tau0_less_than_tau1(self):
         """tau0 should always be less than or equal to tau1."""

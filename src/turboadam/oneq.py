@@ -19,7 +19,10 @@ import torch
 
 from turboadam.utils import is_matrix_param, pad_to_blocks, unpad_from_blocks, BLOCK_SIZE
 from turboadam.svd import svd_compress, svd_reconstruct
-from turboadam.quantize import quantize_logscale, dequantize_logscale
+from turboadam.quantize import (
+    quantize_logscale, dequantize_logscale,
+    quantize_logscale_nbits, dequantize_logscale_nbits,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -92,9 +95,13 @@ def _compress_svd(
 
 
 def _decompress_svd(compressed: dict) -> torch.Tensor:
-    """Reconstruct v from SVD factors."""
+    """Reconstruct v from SVD factors.
+
+    Clamps to non-negative: truncated SVD does not preserve positivity,
+    but v (EMA of g²) is strictly non-negative.
+    """
     v_2d = svd_reconstruct(compressed["U"], compressed["S"], compressed["Vh"])
-    return v_2d.reshape(compressed["original_shape"])
+    return v_2d.reshape(compressed["original_shape"]).clamp(min=0)
 
 
 def _compress_logscale(
@@ -133,6 +140,48 @@ def _decompress_logscale(compressed: dict) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# N-bit log-scale compression (uniform path for all params)
+# ---------------------------------------------------------------------------
+
+def _compress_logscale_nbits(
+    v: torch.Tensor,
+    n_bits: int,
+    block_size: int,
+    stochastic_round: bool = False,
+) -> dict:
+    """Compress v via n-bit log-scale block quantization."""
+    original_shape = v.shape
+    v_flat = v.reshape(-1).float()
+    v_min = v_flat.min().item()
+    pad_value = max(v_min, 1e-38)
+    v_padded, original_length = pad_to_blocks(v_flat, block_size, pad_value=pad_value)
+    indices, scales, nb = quantize_logscale_nbits(
+        v_padded, n_bits=n_bits, block_size=block_size, stochastic_round=stochastic_round,
+    )
+    return {
+        "type": "logscale_nbits",
+        "indices": indices,
+        "scales": scales,
+        "n_bits": n_bits,
+        "original_shape": original_shape,
+        "original_length": original_length,
+        "block_size": block_size,
+    }
+
+
+def _decompress_logscale_nbits(compressed: dict) -> torch.Tensor:
+    """Reconstruct v from n-bit log-scale quantized representation."""
+    v_flat = dequantize_logscale_nbits(
+        compressed["indices"],
+        compressed["scales"],
+        n_bits=compressed["n_bits"],
+        block_size=compressed["block_size"],
+        original_numel=compressed["original_length"],
+    )
+    return v_flat.reshape(compressed["original_shape"])
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -164,21 +213,41 @@ def compress_v(
         return _compress_logscale(v, block_size)
 
 
+def compress_v_logscale(
+    v: torch.Tensor,
+    n_bits: int = 3,
+    block_size: int = BLOCK_SIZE,
+    stochastic_round: bool = False,
+) -> dict:
+    """Compress v via n-bit log-scale quantization (uniform path, all params).
+
+    No matrix/non-matrix routing — uses log-scale quantization for everything.
+
+    Args:
+        v:               Second-moment tensor (any shape, fp32, positive).
+        n_bits:          Bits per element (default 3 = 8 buckets).
+        block_size:      Quantization block size.
+        stochastic_round: Use stochastic rounding (essential for compress-every-step).
+
+    Returns:
+        Compressed dict with 'indices', 'scales', metadata.
+    """
+    return _compress_logscale_nbits(v, n_bits, block_size, stochastic_round=stochastic_round)
+
+
 def decompress_v(compressed: dict) -> torch.Tensor:
     """Reconstruct fp32 v from a compressed representation.
 
-    Dispatches on ``compressed["type"]``.
-
     Args:
-        compressed: Dict produced by ``compress_v`` or ``refresh_v``.
+        compressed: Dict produced by compress_v, compress_v_logscale, or refresh.
 
     Returns:
         fp32 tensor with the same shape as the original v.
     """
-    # Dispatch on structural keys rather than the 'type' string, because
-    # PyTorch's load_state_dict _cast() corrupts strings inside nested dicts.
     if "U" in compressed:
         return _decompress_svd(compressed)
+    elif "indices" in compressed:
+        return _decompress_logscale_nbits(compressed)
     elif "packed" in compressed:
         return _decompress_logscale(compressed)
     else:

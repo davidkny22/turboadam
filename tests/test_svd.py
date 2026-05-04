@@ -14,13 +14,13 @@ class TestSvdCompress:
         assert S.shape == (8,)
         assert Vh.shape == (8, 256)
 
-    def test_factors_are_fp16(self):
-        """Factors stored in fp16 per spec."""
+    def test_factors_are_fp32(self):
+        """Factors stored in fp32 for numerical stability with bias-corrected v̂."""
         v = torch.randn(128, 128)
         U, S, Vh = svd_compress(v, rank=4)
-        assert U.dtype == torch.float16
-        assert S.dtype == torch.float16
-        assert Vh.dtype == torch.float16
+        assert U.dtype == torch.float32
+        assert S.dtype == torch.float32
+        assert Vh.dtype == torch.float32
 
     def test_low_rank_matrix_near_exact(self):
         """A rank-4 matrix compressed at rank 8 should reconstruct near-exactly."""

@@ -13,7 +13,6 @@ import time
 import torch
 import torch.nn as nn
 
-from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from turboadam import TurboAdam
@@ -36,10 +35,15 @@ def parse_args():
     p.add_argument("--output_dir",         type=str,   default="experiments/results", help="Directory for log output")
     p.add_argument("--log_every",          type=int,   default=50,            help="Log interval (steps)")
     p.add_argument("--dry_run",            action="store_true",               help="Run 5 steps only (smoke test)")
+    p.add_argument("--cache_path",         type=str,   default=None,          help="Path to pre-tokenized .pt chunk list (skips HF download)")
     # TurboAdam-specific args
-    p.add_argument("--refresh_mode",       type=str,   default="compressed",  help="TurboAdam refresh mode: 'compressed' or 'single'")
-    p.add_argument("--warmup_threshold",   type=float, default=0.01,          help="TurboAdam warmup threshold for v stabilisation")
-    p.add_argument("--refresh_interval",   type=int,   default=1000,          help="TurboAdam steps between v refresh cycles")
+    p.add_argument("--v_bits",             type=int,   default=4,             help="Bits per element for v compression: 4, 6, 8, or 16 (default 4)")
+    p.add_argument("--no_compress_m",      action="store_true",               help="Ablation: disable CoState m compression (use fp32 m)")
+    p.add_argument("--no_compress_v",      action="store_true",               help="Ablation: disable v compression (use fp32 v)")
+    p.add_argument("--null_pct",           type=float, default=0.10,          help="CoState null threshold percentile (default 0.10)")
+    p.add_argument("--amp_pct",            type=float, default=0.90,          help="CoState amplitude threshold percentile (default 0.90)")
+    p.add_argument("--error_feedback",     action="store_true",               help="Enable CoState error feedback")
+    p.add_argument("--no_amp",             action="store_true",               help="Disable AMP mixed precision")
     return p.parse_args()
 
 
@@ -73,31 +77,11 @@ def get_lr(step: int, warmup_steps: int, total_steps: int, peak_lr: float) -> fl
 # Dataset construction
 # ---------------------------------------------------------------------------
 
-def build_token_chunks(tokenizer, seq_len: int, split: str = "train"):
-    """Stream WikiText-103, tokenize, concat, chunk into seq_len+1 windows."""
-    print(f"Loading WikiText-103 ({split})…")
-    dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split=split)
-
-    # Tokenize each article (no padding/truncation — we'll handle manually)
-    token_ids = []
-    for sample in dataset:
-        text = sample["text"].strip()
-        if not text:
-            continue
-        ids = tokenizer.encode(text, add_special_tokens=False, truncation=False)
-        token_ids.extend(ids)
-        token_ids.append(tokenizer.eos_token_id)  # article boundary
-
-    print(f"  Total tokens: {len(token_ids):,}")
-
-    # Slice into (seq_len + 1) chunks: input = [:-1], target = [1:]
-    chunks = []
-    for i in range(0, len(token_ids) - seq_len, seq_len):
-        chunk = token_ids[i : i + seq_len + 1]
-        if len(chunk) == seq_len + 1:
-            chunks.append(chunk)
-
-    print(f"  Total chunks: {len(chunks):,}")
+def load_chunks(cache_path: str) -> list:
+    """Load pre-tokenized chunks from a .pt file (list of 512-token tensors)."""
+    print(f"Loading tokenized cache from {cache_path}…")
+    chunks = torch.load(cache_path, weights_only=False)
+    print(f"  Chunks: {len(chunks):,}  seq_len: {chunks[0].shape[0]}")
     return chunks
 
 
@@ -109,8 +93,8 @@ class ChunkDataset(torch.utils.data.Dataset):
         return len(self.chunks)
 
     def __getitem__(self, idx):
-        chunk = torch.tensor(self.chunks[idx], dtype=torch.long)
-        return chunk[:-1], chunk[1:]  # input, target
+        chunk = self.chunks[idx].long()
+        return chunk[:-1], chunk[1:]  # input (511), target (511)
 
 
 # ---------------------------------------------------------------------------
@@ -129,11 +113,11 @@ def compute_grad_norm(model: nn.Module) -> float:
 # TurboAdam state inspection helpers
 # ---------------------------------------------------------------------------
 
-def count_warmup_complete(optimizer: TurboAdam) -> int:
-    """Count how many parameters have completed warmup (entered Phase B)."""
+def count_compressed_params(optimizer: TurboAdam) -> int:
+    """Count how many parameters have compressed v state."""
     count = 0
     for state in optimizer.state.values():
-        if state.get("warmup_complete", False):
+        if "compressed_v" in state:
             count += 1
     return count
 
@@ -150,7 +134,7 @@ def get_costate_fractions(optimizer: TurboAdam) -> dict | None:
     total_blocks = 0
 
     for state in optimizer.state.values():
-        costate_mgr = state.get("costate_mgr")
+        costate_mgr = state.get("m_mgr")
         if costate_mgr is None or not costate_mgr._has_state:
             continue
         encoded = costate_mgr._encoded
@@ -193,7 +177,7 @@ def main():
     device = select_device(args.device)
     print(f"Device: {device}")
 
-    use_amp = (device.type == "cuda")
+    use_amp = (device.type == "cuda") and not getattr(args, 'no_amp', False)
     # MPS and CPU run in native precision
     print(f"Mixed precision (AMP): {use_amp}")
 
@@ -220,7 +204,28 @@ def main():
     # -----------------------------------------------------------------------
     # Dataset / DataLoader
     # -----------------------------------------------------------------------
-    chunks = build_token_chunks(tokenizer, args.seq_len, split="train")
+    if args.cache_path:
+        chunks = load_chunks(args.cache_path)
+    else:
+        from datasets import load_dataset
+        print("No --cache_path provided, streaming WikiText-103 from HuggingFace…")
+        def _build_token_chunks(tokenizer, seq_len, split="train"):
+            dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split=split)
+            token_ids = []
+            for sample in dataset:
+                text = sample["text"].strip()
+                if not text:
+                    continue
+                ids = tokenizer.encode(text, add_special_tokens=False, truncation=False)
+                token_ids.extend(ids)
+                token_ids.append(tokenizer.eos_token_id)
+            chunks = []
+            for i in range(0, len(token_ids) - seq_len, seq_len):
+                chunk = token_ids[i : i + seq_len + 1]
+                if len(chunk) == seq_len + 1:
+                    chunks.append(torch.tensor(chunk, dtype=torch.long))
+            return chunks
+        chunks = _build_token_chunks(tokenizer, args.seq_len)
     dataset = ChunkDataset(chunks)
     loader = torch.utils.data.DataLoader(
         dataset,
@@ -235,6 +240,8 @@ def main():
     # -----------------------------------------------------------------------
     # Optimizer — TurboAdam with same hyperparameters as baseline
     # -----------------------------------------------------------------------
+    compress_m = not args.no_compress_m
+    compress_v = not args.no_compress_v
     optimizer = TurboAdam(
         model.parameters(),
         lr=args.lr,
@@ -242,16 +249,18 @@ def main():
         eps=1e-8,
         weight_decay=0.01,
         block_size=128,
-        svd_rank=8,
-        refresh_interval=args.refresh_interval,
-        warmup_threshold=args.warmup_threshold,
-        refresh_mode=args.refresh_mode,
+        v_bits=args.v_bits,
+        compress_m=compress_m,
+        compress_v=compress_v,
+        null_pct=args.null_pct,
+        amp_pct=args.amp_pct,
+        error_feedback=args.error_feedback,
     )
 
     print(
-        f"TurboAdam config: refresh_mode={args.refresh_mode}, "
-        f"warmup_threshold={args.warmup_threshold}, "
-        f"refresh_interval={args.refresh_interval}"
+        f"TurboAdam config: v_bits={args.v_bits}, "
+        f"compress_m={compress_m}, compress_v={compress_v}, "
+        f"null_pct={args.null_pct}, amp_pct={args.amp_pct}"
     )
 
     # Use new-style torch.amp API (torch >= 2.0)
@@ -318,7 +327,7 @@ def main():
             avg_loss = running_loss / args.log_every if step > 1 else running_loss
             elapsed = time.time() - t_start
 
-            warmup_done = count_warmup_complete(optimizer)
+            compressed_count = count_compressed_params(optimizer)
             costate_info = get_costate_fractions(optimizer)
 
             entry = {
@@ -328,7 +337,7 @@ def main():
                 "lr": lr,
                 "grad_norm": round(grad_norm, 6),
                 "elapsed_s": round(elapsed, 2),
-                "warmup_complete_count": warmup_done,
+                "compressed_count": compressed_count,
             }
             if costate_info is not None:
                 entry.update(costate_info)
@@ -346,7 +355,7 @@ def main():
             print(
                 f"step {step:>5d}  loss {entry['loss']:.4f}  "
                 f"lr {lr:.2e}  grad_norm {grad_norm:.3f}  "
-                f"warmup_done {warmup_done}"
+                f"compressed {compressed_count}"
                 f"{costate_str}  elapsed {elapsed:.1f}s"
             )
             if step % args.log_every == 0:

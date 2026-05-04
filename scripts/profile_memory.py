@@ -1,181 +1,113 @@
-"""Memory profiling instrumentation for TurboAdam.
+"""Memory profiling script for TurboAdam.
 
-Tracks per-component optimizer state memory at each step.
-Produces JSONL logs and memory profile figures.
+Measures actual GPU memory allocated for optimizer states under
+various configurations using a synthetic GPT-2-layer param set.
 
 Usage:
-    python scripts/profile_memory.py --steps 500 --warmup_threshold 0.01
-    python scripts/profile_memory.py --steps 500 --warmup_threshold 100.0  # fast Phase B
+    python scripts/profile_memory.py
 """
 
-import argparse
+import gc
 import json
-import math
 import os
-import sys
 
 import torch
 import torch.nn as nn
 
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Profile TurboAdam memory usage")
-    p.add_argument("--steps", type=int, default=500)
-    p.add_argument("--warmup_threshold", type=float, default=0.01)
-    p.add_argument("--refresh_interval", type=int, default=1000)
-    p.add_argument("--refresh_mode", type=str, default="compressed")
-    p.add_argument("--output_dir", type=str, default="experiments/results")
-    p.add_argument("--model_dim", type=int, default=256,
-                   help="Hidden dimension for the test MLP (controls param count)")
-    return p.parse_args()
+from turboadam import TurboAdam
 
 
-def tensor_bytes(t):
-    """Return the memory footprint of a tensor in bytes."""
-    return t.nelement() * t.element_size()
+def _make_params(device: str = "cuda"):
+    """Return a list of Parameters mimicking one GPT-2 layer."""
+    shapes = [
+        (768, 768), (768, 768), (768, 768), (768, 768),
+        (768, 3072), (3072, 768),
+        (768,), (768,), (768,),
+    ]
+    params = []
+    for s in shapes:
+        p = nn.Parameter(torch.randn(s, device=device))
+        p.grad = torch.randn_like(p)
+        params.append(p)
+    return params
 
 
-def measure_state_bytes(optimizer):
-    """Measure total optimizer state memory in bytes, broken down by component."""
-    total = 0
-    v_bytes = 0
-    m_bytes = 0
-    metadata_bytes = 0
+def _measure_memory(opt_class, opt_kwargs, params):
+    """Return bytes allocated for optimizer states after 1 step."""
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
 
-    for state in optimizer.state.values():
-        for key, val in state.items():
-            if isinstance(val, torch.Tensor):
-                b = tensor_bytes(val)
-                total += b
-                if key in ("exp_avg_sq", "v_prev"):
-                    v_bytes += b
-                elif key in ("g_sq_accum",):
-                    v_bytes += b  # accumulator is v-related
-                else:
-                    metadata_bytes += b
-            elif isinstance(val, dict):
-                # Compressed dicts (compressed_v, encoded CoState state)
-                for subkey, subval in val.items():
-                    if isinstance(subval, torch.Tensor):
-                        b = tensor_bytes(subval)
-                        total += b
-                        if key == "compressed_v":
-                            v_bytes += b
-                        elif key in ("g_sq_accum_packed", "g_sq_accum_scales"):
-                            v_bytes += b
-                        else:
-                            m_bytes += b
-            # Also count top-level packed accum tensors
-            if key in ("g_sq_accum_packed", "g_sq_accum_scales"):
-                if isinstance(val, torch.Tensor):
-                    b = tensor_bytes(val)
-                    v_bytes += b
+    opt = opt_class(params, lr=1e-3, **opt_kwargs)
+    opt.step()
 
-    return {"total": total, "v": v_bytes, "m": m_bytes, "metadata": metadata_bytes}
+    peak = torch.cuda.max_memory_allocated()
+    # The delta from base is dominated by optimizer state + any temporaries
+    # We also measure the persistent state by summing state tensor sizes
+    persistent = 0
+    for state in opt.state.values():
+        for v in state.values():
+            if isinstance(v, torch.Tensor):
+                persistent += v.numel() * v.element_size()
+            elif isinstance(v, dict):
+                for vv in v.values():
+                    if isinstance(vv, torch.Tensor):
+                        persistent += vv.numel() * vv.element_size()
+            elif hasattr(v, '_encoded') and v._encoded is not None:
+                for vv in v._encoded.values():
+                    if isinstance(vv, torch.Tensor):
+                        persistent += vv.numel() * vv.element_size()
+
+    return peak - base, persistent
 
 
 def main():
-    args = parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
+    if not torch.cuda.is_available():
+        print("CUDA not available — memory profiling requires GPU.")
+        return
 
-    from turboadam import TurboAdam
+    configs = [
+        ("AdamW (baseline)", torch.optim.AdamW, {}),
+        ("TurboAdam (m+v)", TurboAdam, {}),
+        ("TurboAdam (v only)", TurboAdam, {"compress_m": False}),
+        ("TurboAdam (m only)", TurboAdam, {"compress_v": False}),
+        ("TurboAdam (no compression)", TurboAdam, {"compress_m": False, "compress_v": False}),
+    ]
 
-    # Build a small MLP to profile
-    d = args.model_dim
-    model = nn.Sequential(
-        nn.Linear(d, d * 4),
-        nn.ReLU(),
-        nn.Linear(d * 4, d * 4),
-        nn.ReLU(),
-        nn.Linear(d * 4, d),
-    )
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model: {n_params:,} parameters ({n_params * 4 / 1024:.1f} KB at fp32)")
+    print("=" * 60)
+    print("TurboAdam Memory Profile")
+    print("Param set: one GPT-2 layer (9 tensors)")
+    print("=" * 60)
 
-    optimizer = TurboAdam(
-        model.parameters(), lr=1e-3,
-        warmup_threshold=args.warmup_threshold,
-        refresh_interval=args.refresh_interval,
-        refresh_mode=args.refresh_mode,
-    )
+    results = []
+    baseline_persistent = None
+    for name, cls, kwargs in configs:
+        params = _make_params()
+        peak_delta, persistent = _measure_memory(cls, kwargs, params)
 
-    # Baseline: standard Adam state size
-    baseline_bytes = n_params * 8  # m (fp32) + v (fp32) = 8 bytes/param
+        if baseline_persistent is None:
+            baseline_persistent = persistent
+            ratio = 1.0
+        else:
+            ratio = persistent / baseline_persistent
 
-    log_path = os.path.join(args.output_dir, "memory_profile.jsonl")
-    entries = []
+        print(f"{name:30s} persistent={persistent:8,} B  ({ratio:.2f}x vs baseline)")
+        results.append({
+            "config": name,
+            "peak_delta_bytes": peak_delta,
+            "persistent_bytes": persistent,
+            "ratio_vs_baseline": ratio,
+        })
 
-    torch.manual_seed(42)
-    x = torch.randn(16, d)
-    target = torch.randn(16, d)
+    print("=" * 60)
 
-    for step in range(1, args.steps + 1):
-        optimizer.zero_grad()
-        out = model(x)
-        loss = nn.functional.mse_loss(out, target)
-        loss.backward()
-        optimizer.step()
-
-        mem = measure_state_bytes(optimizer)
-        bits_per_param = (mem["total"] * 8) / n_params if n_params > 0 else 0
-        entry = {
-            "step": step,
-            "total_bytes": mem["total"],
-            "v_bytes": mem["v"],
-            "m_bytes": mem["m"],
-            "metadata_bytes": mem["metadata"],
-            "baseline_bytes": baseline_bytes,
-            "bits_per_param": round(bits_per_param, 2),
-            "compression_ratio": round(baseline_bytes / max(mem["total"], 1), 1),
-            "loss": loss.item(),
-        }
-        entries.append(entry)
-
-        if step % 50 == 0 or step == 1:
-            print(f"step={step} state={mem['total']:,}B "
-                  f"({bits_per_param:.1f} bits/param, "
-                  f"{entry['compression_ratio']}x compression) "
-                  f"loss={loss.item():.4f}")
-
-    with open(log_path, "w") as f:
-        for e in entries:
-            f.write(json.dumps(e) + "\n")
-    print(f"\nProfile saved to {log_path}")
-
-    # Generate plot
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-
-        steps = [e["step"] for e in entries]
-        total = [e["total_bytes"] for e in entries]
-        baseline = [e["baseline_bytes"] for e in entries]
-
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-
-        ax1.plot(steps, baseline, "r--", label="Baseline Adam", linewidth=2)
-        ax1.plot(steps, total, "b-", label="TurboAdam", linewidth=2)
-        ax1.set_ylabel("Optimizer State (bytes)")
-        ax1.set_title("Optimizer State Memory Profile")
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
-
-        bpp = [e["bits_per_param"] for e in entries]
-        ax2.plot(steps, bpp, "g-", linewidth=2)
-        ax2.axhline(y=64, color="r", linestyle="--", label="Baseline (64 bits/param)")
-        ax2.set_xlabel("Training Step")
-        ax2.set_ylabel("Bits per Parameter")
-        ax2.set_title("Compression Ratio Over Training")
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        fig_path = os.path.join(args.output_dir, "memory_profile.png")
-        plt.savefig(fig_path, dpi=150)
-        print(f"Figure saved to {fig_path}")
-    except ImportError:
-        print("matplotlib not available — skipping plot generation")
+    # Save results
+    os.makedirs("experiments/results", exist_ok=True)
+    out_path = "experiments/results/memory_profile.json"
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"Results saved to {out_path}")
 
 
 if __name__ == "__main__":

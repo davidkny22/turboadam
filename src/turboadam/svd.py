@@ -3,8 +3,13 @@
 Computes truncated SVD: V ≈ U_r · S_r · W_rᵀ
 Used by 1Q for matrix parameters (ndim >= 2 and numel > 10,000).
 
-Storage: (rows*r + r + cols*r) * 2 bytes per matrix.
+Storage: (rows*r + r + cols*r) * 4 bytes per matrix (fp32 factors).
 Reconstruction: small matrix multiply at each step.
+
+fp32 factors (not fp16): the bias-corrected v̂ = v / (1 - β₂^t) is
+amplified early in training, making fp16 too lossy. fp32 factors still
+achieve >70x compression on large matrices while staying numerically
+stable through the Phase A→B transition.
 """
 
 import torch
@@ -13,23 +18,23 @@ import torch
 def svd_compress(
     v_matrix: torch.Tensor, rank: int = 8
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compress a 2D tensor via truncated SVD, storing factors in fp16.
+    """Compress a 2D tensor via truncated SVD, storing factors in fp32.
 
     Args:
         v_matrix: 2D fp32 tensor to compress.
         rank: Number of singular values to keep.
 
     Returns:
-        (U_r, S_r, Vh_r) in fp16 where U_r is (rows, r), S_r is (r,),
+        (U_r, S_r, Vh_r) in fp32 where U_r is (rows, r), S_r is (r,),
         Vh_r is (r, cols).
     """
     assert v_matrix.ndim == 2
     r = min(rank, min(v_matrix.shape))
-    U, S, V = torch.svd_lowrank(v_matrix, q=r, niter=2)
+    U, S, V = torch.svd_lowrank(v_matrix.float(), q=r, niter=2)
     # U: (rows, r), S: (r,), V: (cols, r) — note V not Vh
-    U_r = U[:, :r].to(torch.float16)
-    S_r = S[:r].to(torch.float16)
-    Vh_r = V[:, :r].t().to(torch.float16)  # transpose to (r, cols)
+    U_r = U[:, :r]
+    S_r = S[:r]
+    Vh_r = V[:, :r].t()  # transpose to (r, cols)
     return U_r, S_r, Vh_r
 
 
@@ -46,5 +51,4 @@ def svd_reconstruct(
     Returns:
         Reconstructed fp32 matrix of shape (rows, cols).
     """
-    # Promote to fp32 for reconstruction precision
     return (U.float() * S.float().unsqueeze(0)) @ Vh.float()
