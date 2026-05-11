@@ -1,4 +1,10 @@
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    __version__ = version("turboadam")
+except PackageNotFoundError:
+    __version__ = "unknown"
+
 from turboadam.optimizer import TurboAdam
 
-__version__ = "0.1.0"
 __all__ = ["TurboAdam"]

@@ -54,9 +54,15 @@ class TurboAdam(Optimizer):
         null_pct: float = 0.10,
         amp_pct: float = 0.90,
         error_feedback: bool = False,
+        capturable: bool = False,
+        min_m_compress_elements: int = 4096,
     ):
         if v_bits not in (2, 3, 4, 6, 8):
             raise ValueError(f"v_bits must be one of {{2, 3, 4, 6, 8}}, got {v_bits}")
+        if capturable:
+            raise NotImplementedError(
+                "CUDA graph capture is not yet supported. Set capturable=False."
+            )
         defaults = dict(
             lr=lr,
             betas=betas,
@@ -69,12 +75,13 @@ class TurboAdam(Optimizer):
             null_pct=null_pct,
             amp_pct=amp_pct,
             error_feedback=error_feedback,
+            min_m_compress_elements=min_m_compress_elements,
         )
         super().__init__(params, defaults)
         self._group_step_tensors = {}
 
     # ------------------------------------------------------------------
-    # Core step logic (called directly or captured in CUDA graph)
+    # Core step logic
     # ------------------------------------------------------------------
 
     def _full_step_kernel(self):
@@ -117,13 +124,19 @@ class TurboAdam(Optimizer):
                         # Refill random buffer for stochastic rounding (graph-safe:
                         # same tensor address, only contents change)
                         cv["rand_buf"].uniform_()
+                        # Allocate separate output buffers to avoid aliasing
+                        # (Triton assumes no aliasing between pointer args)
+                        _new_indices = torch.empty_like(cv["indices"])
+                        _new_scales = torch.empty_like(cv["scales"])
                         new_indices, new_scales, v_flat = _v_update_fn(
                             cv["indices"], cv["scales"], grad, beta2,
                             cv["n_bits"], cv["block_size"], cv["original_length"],
                             rand_buf=cv["rand_buf"],
-                            out_indices=cv["indices"],
-                            out_scales=cv["scales"],
+                            out_indices=_new_indices,
+                            out_scales=_new_scales,
                         )
+                        cv["indices"] = new_indices
+                        cv["scales"] = new_scales
                     else:
                         new_indices, new_scales, v_flat = _v_update_fn(
                             cv["indices"], cv["scales"], grad, beta2,
@@ -142,28 +155,50 @@ class TurboAdam(Optimizer):
                 p.addcdiv_(m_new, denom * bias_correction1, value=-lr)
 
     def _prepare_step_scalars(self):
-        """Update per-parameter scalar tensors for the next optimizer step."""
-        for group_idx, group in enumerate(self.param_groups):
+        """Update per-parameter scalar tensors for the next optimizer step.
+
+        Each parameter computes its own bias correction based on its own step
+        counter, so add_param_group() and checkpoint resume work correctly.
+        """
+        for group in self.param_groups:
             beta1, beta2 = group["betas"]
-            next_step = None
-            # Find the step count from the first param with state in this group
-            for p in group["params"]:
-                if p.grad is None or p not in self.state:
-                    continue
-                next_step = self.state[p]["step"] + 1  # step increments inside _full_step_kernel
-                break
-            if next_step is None:
-                continue
-            bc1_val = 1.0 - beta1 ** next_step
-            bc2_val = 1.0 - beta2 ** next_step
-            # Update ALL params in this group so save/load state_dict remains correct
-            # (each param gets its own copy of the scalars on load)
             for p in group["params"]:
                 if p not in self.state:
                     continue
                 state = self.state[p]
-                state["_bc1"].fill_(bc1_val)
-                state["_bc2"].fill_(bc2_val)
+                next_step = state["step"] + 1  # step increments inside _full_step_kernel
+                state["_bc1"].fill_(1.0 - beta1 ** next_step)
+                state["_bc2"].fill_(1.0 - beta2 ** next_step)
+
+    # ------------------------------------------------------------------
+    # State dict handling
+    # ------------------------------------------------------------------
+
+    def load_state_dict(self, state_dict):
+        """Load optimizer state, migrating CoStateManager tensors to param device.
+
+        PyTorch's default load_state_dict casts tensors in dicts but does not
+        recurse into custom objects. CoStateManager stores tensors internally
+        that must move to the correct device after loading.
+        """
+        super().load_state_dict(state_dict)
+        # Migrate CoStateManager internal tensors to their parameter's device
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p not in self.state:
+                    continue
+                state = self.state[p]
+                if "m_mgr" in state:
+                    mgr = state["m_mgr"]
+                    device = p.device
+                    if isinstance(mgr._alpha, torch.Tensor):
+                        mgr._alpha = mgr._alpha.to(device=device)
+                    if mgr._encoded is not None:
+                        for key in ("labels", "sign_packed", "block_norms", "scales"):
+                            if key in mgr._encoded:
+                                mgr._encoded[key] = mgr._encoded[key].to(device=device)
+                    if mgr._ef_residual is not None:
+                        mgr._ef_residual = mgr._ef_residual.to(device=device)
 
     # ------------------------------------------------------------------
     # Main step
@@ -191,7 +226,7 @@ class TurboAdam(Optimizer):
                 state = self.state[p]
                 if len(state) == 0:
                     state["step"] = 0
-                    compress_this_m = use_compress_m and p.numel() >= 4096
+                    compress_this_m = use_compress_m and p.numel() >= group["min_m_compress_elements"]
                     state["_compress_m"] = compress_this_m
                     if compress_this_m:
                         state["m_mgr"] = CoStateManager(
@@ -209,12 +244,10 @@ class TurboAdam(Optimizer):
                         self._group_step_tensors[device_key] = {
                             "bc1": torch.empty(1, dtype=torch.float32, device=p.device),
                             "bc2": torch.empty(1, dtype=torch.float32, device=p.device),
-                            "step_seed": torch.empty(1, dtype=torch.int64, device=p.device),
                         }
                     group_tensors = self._group_step_tensors[device_key]
                     state["_bc1"] = group_tensors["bc1"]
                     state["_bc2"] = group_tensors["bc2"]
-                    state["_step_seed"] = group_tensors["step_seed"]
 
                 # First step: init compressed_v with near-zero so _step_kernel
                 # can do the real first EMA update (avoids double-counting g²)

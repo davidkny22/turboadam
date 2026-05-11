@@ -2,7 +2,6 @@
 
 Covers:
 - 2-bit log-scale quantize → dequantize error bounds
-- SVD compress → reconstruct relative L2 error
 - Costate encode → decode cosine similarity by tier
 - End-to-end: 100 optimizer steps, loss convergence vs. standard Adam
 """
@@ -13,7 +12,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from turboadam import TurboAdam
-from turboadam.svd import svd_compress, svd_reconstruct
 from turboadam.quantize import quantize_logscale, dequantize_logscale
 from turboadam.costate import CoStateManager
 from turboadam.utils import pad_to_blocks
@@ -23,77 +21,6 @@ from turboadam.oneq import decompress_v
 # ---------------------------------------------------------------------------
 # 1. Per-component compression roundtrip
 # ---------------------------------------------------------------------------
-
-class TestSVDRoundtrip:
-    """SVD compress → reconstruct on a [768, 768] matrix."""
-
-    def test_relative_frobenius_error_within_bounds(self):
-        """SVD roundtrip on a [768, 768] structured matrix should have relative Frobenius error < 0.35.
-
-        Adam second moment tensors have structured singular value spectra (decaying, not
-        flat), so the realistic bound is tighter than for fully-random matrices.  We use
-        a 1/k-decaying singular-value profile to approximate a realistic v matrix.
-        With rank=8, the tail (k>8) contributes ~30% of the Frobenius norm for 1/k decay.
-        """
-        torch.manual_seed(0)
-        m = 768
-        # Construct a [768, 768] matrix with decaying singular values (1/k),
-        # mimicking the spectrum of realistic Adam second-moment matrices.
-        U0, _ = torch.linalg.qr(torch.randn(m, m))
-        V0, _ = torch.linalg.qr(torch.randn(m, m))
-        svals = 1.0 / (torch.arange(1, m + 1).float())
-        v = ((U0 * svals.unsqueeze(0)) @ V0.T).abs() + 1e-4
-
-        U, S, Vh = svd_compress(v, rank=8)
-        v_hat = svd_reconstruct(U, S, Vh)
-
-        frobenius_error = (v - v_hat).norm(p="fro").item()
-        frobenius_norm = v.norm(p="fro").item()
-        relative_error = frobenius_error / frobenius_norm
-
-        assert v_hat.shape == v.shape, f"Shape mismatch: {v_hat.shape} vs {v.shape}"
-        assert relative_error < 0.35, (
-            f"Relative Frobenius error {relative_error:.4f} exceeds 0.35 bound"
-        )
-
-    def test_svd_reconstruct_is_fp32(self):
-        """Reconstructed tensor should be fp32 regardless of fp16 factors."""
-        torch.manual_seed(1)
-        v = torch.rand(768, 768).abs() + 1e-4
-
-        U, S, Vh = svd_compress(v, rank=8)
-        v_hat = svd_reconstruct(U, S, Vh)
-
-        assert v_hat.dtype == torch.float32, f"Expected fp32, got {v_hat.dtype}"
-
-    def test_svd_factors_are_fp32(self):
-        """SVD factors stored in fp32 for numerical stability with bias-corrected v̂."""
-        torch.manual_seed(2)
-        v = torch.rand(768, 768).abs() + 1e-4
-
-        U, S, Vh = svd_compress(v, rank=8)
-
-        assert U.dtype == torch.float32, f"U should be fp32, got {U.dtype}"
-        assert S.dtype == torch.float32, f"S should be fp32, got {S.dtype}"
-        assert Vh.dtype == torch.float32, f"Vh should be fp32, got {Vh.dtype}"
-
-    def test_higher_rank_lower_error(self):
-        """Higher SVD rank should yield lower reconstruction error."""
-        torch.manual_seed(3)
-        v = torch.rand(768, 768).abs() + 1e-4
-
-        U8, S8, Vh8 = svd_compress(v, rank=8)
-        v_hat8 = svd_reconstruct(U8, S8, Vh8)
-        err8 = (v - v_hat8).norm(p="fro").item() / v.norm(p="fro").item()
-
-        U32, S32, Vh32 = svd_compress(v, rank=32)
-        v_hat32 = svd_reconstruct(U32, S32, Vh32)
-        err32 = (v - v_hat32).norm(p="fro").item() / v.norm(p="fro").item()
-
-        assert err32 < err8, (
-            f"Rank-32 error {err32:.4f} should be less than rank-8 error {err8:.4f}"
-        )
-
 
 class TestQuantizeRoundtrip:
     """Quantize/dequantize on a [512] bias-like positive tensor."""

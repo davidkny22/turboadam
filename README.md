@@ -49,7 +49,7 @@ optimizer = TurboAdam(
     lr=6e-4,
     betas=(0.9, 0.999),
     weight_decay=0.01,
-    v_bits=4,          # 4, 6, 8, or 16
+    v_bits=4,          # 2, 3, 4, 6, or 8
     compress_m=True,   # CoState first-moment compression
     compress_v=True,   # Log-scale second-moment compression
 )
@@ -143,23 +143,29 @@ TurboAdam(
     eps=1e-8,                  # numerical stability
     weight_decay=0.0,          # AdamW-style decoupled weight decay
     block_size=128,            # quantization block size (elements)
-    v_bits=4,                  # bits per element for v: 4, 6, 8, or 16
+    v_bits=4,                  # bits per element for v: 2, 3, 4, 6, or 8
     compress_m=True,           # enable CoState m compression
     compress_v=True,           # enable v compression
     null_pct=0.10,             # CoState null threshold percentile
     amp_pct=0.90,              # CoState amplitude threshold percentile
     error_feedback=False,      # CoState error feedback (tested, no improvement)
+    capturable=False,          # CUDA graph capture (not yet supported)
+    min_m_compress_elements=4096,  # minimum param size for CoState m compression
 )
 ```
 
 All arguments are standard PyTorch Optimizer kwargs plus TurboAdam-specific compression controls. State dicts are fully compatible with `torch.save` / `torch.load`.
+
+**Notes:**
+- `torch.compile` will graph-break at `opt.step()` (expected for Python-loop optimizers; does not affect correctness).
+- FSDP / DeepSpeed ZeRO compatibility is on the [roadmap](ROADMAP.md) for v0.2.0.
 
 ---
 
 ## Validation
 
 ```bash
-# Full test suite (167 tests)
+# Full test suite (148 tests)
 python -m pytest tests/ -q
 
 # Quick convergence smoke test

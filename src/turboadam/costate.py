@@ -364,6 +364,10 @@ class CoStateManager:
         Returns:
             m_new: Updated first moment tensor, same shape as g.
         """
+        # Cast gradient to fp32 — CoState accumulators are fp32, and fp16/bf16
+        # gradients would cause dtype mismatches in dot products.
+        g = g.float()
+
         # Use Triton kernels if available and on CUDA
         try:
             from turboadam.triton_kernels import (
