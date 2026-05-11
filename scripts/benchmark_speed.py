@@ -21,12 +21,19 @@ from turboadam import TurboAdam
 # Benchmark param set
 # ---------------------------------------------------------------------------
 
+
 def _make_params(device: str = "cuda"):
     """Return a list of Parameters mimicking one GPT-2 layer."""
     shapes = [
-        (768, 768), (768, 768), (768, 768), (768, 768),
-        (768, 3072), (3072, 768),
-        (768,), (768,), (768,),
+        (768, 768),
+        (768, 768),
+        (768, 768),
+        (768, 768),
+        (768, 3072),
+        (3072, 768),
+        (768,),
+        (768,),
+        (768,),
     ]
     params = []
     for s in shapes:
@@ -39,6 +46,7 @@ def _make_params(device: str = "cuda"):
 # ---------------------------------------------------------------------------
 # Timing helper
 # ---------------------------------------------------------------------------
+
 
 def _benchmark(opt_class, opt_kwargs, params, n_warmup: int = 50, n_measure: int = 200):
     """Return median ms/step over n_measure steps after warmup."""
@@ -65,6 +73,7 @@ def _benchmark(opt_class, opt_kwargs, params, n_warmup: int = 50, n_measure: int
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     if not torch.cuda.is_available():
         print("CUDA not available — benchmark requires GPU.")
@@ -75,7 +84,11 @@ def main():
         ("TurboAdam (m+v)", TurboAdam, {}),
         ("TurboAdam (v only)", TurboAdam, {"compress_m": False}),
         ("TurboAdam (m only)", TurboAdam, {"compress_v": False}),
-        ("TurboAdam (no compression)", TurboAdam, {"compress_m": False, "compress_v": False}),
+        (
+            "TurboAdam (no compression)",
+            TurboAdam,
+            {"compress_m": False, "compress_v": False},
+        ),
     ]
 
     print("=" * 60)

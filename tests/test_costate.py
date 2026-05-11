@@ -2,7 +2,6 @@
 
 import math
 import torch
-import pytest
 from turboadam.costate import (
     decompose,
     compute_block_ratios,
@@ -86,7 +85,9 @@ class TestComputeBlockRatios:
         delta = m.clone()
         ratios = compute_block_ratios(delta, m, self.BLOCK_SIZE)
         assert ratios.shape == (2,)
-        assert torch.allclose(ratios, torch.ones(2), atol=1e-5), f"Expected all-ones ratios, got {ratios}"
+        assert torch.allclose(ratios, torch.ones(2), atol=1e-5), (
+            f"Expected all-ones ratios, got {ratios}"
+        )
 
     def test_zero_m_block(self):
         """When an m block is all zeros, the ratio for that block should be 0."""
@@ -120,7 +121,9 @@ class TestComputeBlockRatios:
         delta = torch.randn(128)
         r1 = compute_block_ratios(delta, m, self.BLOCK_SIZE)
         r2 = compute_block_ratios(2 * delta, m, self.BLOCK_SIZE)
-        assert torch.allclose(r2, 2 * r1, atol=1e-5), f"Expected 2x ratio scaling, got {r1} vs {r2}"
+        assert torch.allclose(r2, 2 * r1, atol=1e-5), (
+            f"Expected 2x ratio scaling, got {r1} vs {r2}"
+        )
 
 
 class TestComputeThresholds:
@@ -331,7 +334,9 @@ class TestEncodeDecodeBlocks:
 
         # scale stored as fp16 = block_norm / sqrt(block_size) (per-element uniform magnitude)
         norm_d = delta.norm()
-        scale_fp16 = (norm_d / math.sqrt(self.BLOCK_SIZE)).to(torch.float16).to(torch.float32)
+        scale_fp16 = (
+            (norm_d / math.sqrt(self.BLOCK_SIZE)).to(torch.float16).to(torch.float32)
+        )
         delta_hat = scale_fp16 * torch.sign(delta)
         expected = alpha * g + delta_hat
         assert torch.allclose(result, expected, atol=1e-2), (
@@ -394,7 +399,11 @@ class TestEncodeDecodeBlocks:
                 expected[start:end] += scale * torch.sign(db)
             else:
                 # Amplitude: stored scale = block_norm / sqrt(block_size) in fp16
-                scale_fp16 = (db.norm() / math.sqrt(self.BLOCK_SIZE)).to(torch.float16).to(torch.float32)
+                scale_fp16 = (
+                    (db.norm() / math.sqrt(self.BLOCK_SIZE))
+                    .to(torch.float16)
+                    .to(torch.float32)
+                )
                 expected[start:end] += scale_fp16 * torch.sign(db)
 
         assert torch.allclose(result, expected, atol=1e-2), (
@@ -472,7 +481,7 @@ class TestCoStateManager:
         mgr = CoStateManager(block_size=self.BLOCK_SIZE)
         g1 = torch.randn(256)
         g2 = torch.randn(256)
-        m1 = mgr.update(g1, self.BETA1)
+        mgr.update(g1, self.BETA1)
         m2 = mgr.update(g2, self.BETA1)
         # m2 should be different from a fresh first-call result
         fresh_mgr = CoStateManager(block_size=self.BLOCK_SIZE)
@@ -496,7 +505,9 @@ class TestCoStateManager:
     # Reconstruction fidelity: spec section 4.6 table bounds
     # -----------------------------------------------------------------------
 
-    def _check_fidelity(self, costate_type: str, m_true: torch.Tensor, m_hat: torch.Tensor):
+    def _check_fidelity(
+        self, costate_type: str, m_true: torch.Tensor, m_hat: torch.Tensor
+    ):
         """Assert spec section 4.6 fidelity bounds hold for a given costate type."""
         rel_l2 = (m_true - m_hat).norm() / (m_true.norm() + 1e-8)
         cos_sim = torch.nn.functional.cosine_similarity(
@@ -611,8 +622,8 @@ class TestCoStateManager:
         for step in range(100):
             angle = step * 0.002  # slow, realistic rotation (0.002 rad/step)
             g = torch.zeros(n)
-            g[:n // 2] = math.cos(angle)
-            g[n // 2:] = math.sin(angle)
+            g[: n // 2] = math.cos(angle)
+            g[n // 2 :] = math.sin(angle)
             g = g + 0.001 * torch.randn(n)  # small noise (0.1%)
             # NOT unit-normalised: norm ≈ sqrt(n/2) ≈ 16 (realistic magnitude)
 

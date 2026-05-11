@@ -1,7 +1,6 @@
 """Tests for 1Q second moment compression (n-bit log-scale path)."""
 
 import torch
-import pytest
 
 from turboadam.oneq import compress_v_logscale, decompress_v
 
@@ -51,13 +50,21 @@ class TestCompressVLogscale:
 
     def test_stochastic_rounding_different_each_call(self):
         v = _make_v((256,))
-        compressed_1 = compress_v_logscale(v, n_bits=4, block_size=128, stochastic_round=True)
-        compressed_2 = compress_v_logscale(v, n_bits=4, block_size=128, stochastic_round=True)
+        compressed_1 = compress_v_logscale(
+            v, n_bits=4, block_size=128, stochastic_round=True
+        )
+        compressed_2 = compress_v_logscale(
+            v, n_bits=4, block_size=128, stochastic_round=True
+        )
         # Stochastic rounding should produce different indices
         assert not torch.equal(compressed_1["indices"], compressed_2["indices"])
 
     def test_detinistic_rounding_same_each_call(self):
         v = _make_v((256,))
-        compressed_1 = compress_v_logscale(v, n_bits=4, block_size=128, stochastic_round=False)
-        compressed_2 = compress_v_logscale(v, n_bits=4, block_size=128, stochastic_round=False)
+        compressed_1 = compress_v_logscale(
+            v, n_bits=4, block_size=128, stochastic_round=False
+        )
+        compressed_2 = compress_v_logscale(
+            v, n_bits=4, block_size=128, stochastic_round=False
+        )
         assert torch.equal(compressed_1["indices"], compressed_2["indices"])

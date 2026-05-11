@@ -9,8 +9,6 @@ Covers:
 import torch
 import pytest
 from turboadam.utils import (
-    BLOCK_SIZE,
-    MATRIX_NUMEL_THRESHOLD,
     pad_to_blocks,
     unpad_from_blocks,
     is_matrix_param,
@@ -20,6 +18,7 @@ from turboadam.utils import (
 # ---------------------------------------------------------------------------
 # pad_to_blocks
 # ---------------------------------------------------------------------------
+
 
 class TestPadToBlocks:
     def test_exact_multiple_unchanged_values(self):
@@ -88,6 +87,7 @@ class TestPadToBlocks:
 # unpad_from_blocks
 # ---------------------------------------------------------------------------
 
+
 class TestUnpadFromBlocks:
     def test_roundtrip_exact_multiple(self):
         """unpad(pad(t)) == t for exact-multiple length."""
@@ -121,6 +121,7 @@ class TestUnpadFromBlocks:
 # ---------------------------------------------------------------------------
 # is_matrix_param
 # ---------------------------------------------------------------------------
+
 
 class TestIsMatrixParam:
     def test_2d_large_is_matrix(self):

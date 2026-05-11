@@ -22,34 +22,88 @@ from turboadam import TurboAdam
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def parse_args():
     p = argparse.ArgumentParser(description="TurboAdam training on GPT-2 124M")
-    p.add_argument("--steps",              type=int,   default=2000,          help="Total optimizer steps")
-    p.add_argument("--batch_size",         type=int,   default=4,             help="Micro-batch size (sequences per GPU step)")
-    p.add_argument("--accum_steps",        type=int,   default=4,             help="Gradient accumulation steps (effective batch = batch_size * accum_steps)")
-    p.add_argument("--lr",                 type=float, default=6e-4,          help="Peak learning rate")
-    p.add_argument("--warmup_steps",       type=int,   default=100,           help="Linear warmup steps")
-    p.add_argument("--seed",               type=int,   default=42,            help="Random seed")
-    p.add_argument("--seq_len",            type=int,   default=512,           help="Sequence length (tokens)")
-    p.add_argument("--device",             type=str,   default=None,          help="Device: cuda / mps / cpu (auto-detected if omitted)")
-    p.add_argument("--output_dir",         type=str,   default="experiments/results", help="Directory for log output")
-    p.add_argument("--log_every",          type=int,   default=50,            help="Log interval (steps)")
-    p.add_argument("--dry_run",            action="store_true",               help="Run 5 steps only (smoke test)")
-    p.add_argument("--cache_path",         type=str,   default=None,          help="Path to pre-tokenized .pt chunk list (skips HF download)")
+    p.add_argument("--steps", type=int, default=2000, help="Total optimizer steps")
+    p.add_argument(
+        "--batch_size",
+        type=int,
+        default=4,
+        help="Micro-batch size (sequences per GPU step)",
+    )
+    p.add_argument(
+        "--accum_steps",
+        type=int,
+        default=4,
+        help="Gradient accumulation steps (effective batch = batch_size * accum_steps)",
+    )
+    p.add_argument("--lr", type=float, default=6e-4, help="Peak learning rate")
+    p.add_argument("--warmup_steps", type=int, default=100, help="Linear warmup steps")
+    p.add_argument("--seed", type=int, default=42, help="Random seed")
+    p.add_argument("--seq_len", type=int, default=512, help="Sequence length (tokens)")
+    p.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device: cuda / mps / cpu (auto-detected if omitted)",
+    )
+    p.add_argument(
+        "--output_dir",
+        type=str,
+        default="experiments/results",
+        help="Directory for log output",
+    )
+    p.add_argument("--log_every", type=int, default=50, help="Log interval (steps)")
+    p.add_argument(
+        "--dry_run", action="store_true", help="Run 5 steps only (smoke test)"
+    )
+    p.add_argument(
+        "--cache_path",
+        type=str,
+        default=None,
+        help="Path to pre-tokenized .pt chunk list (skips HF download)",
+    )
     # TurboAdam-specific args
-    p.add_argument("--v_bits",             type=int,   default=4,             help="Bits per element for v compression: 4, 6, 8, or 16 (default 4)")
-    p.add_argument("--no_compress_m",      action="store_true",               help="Ablation: disable CoState m compression (use fp32 m)")
-    p.add_argument("--no_compress_v",      action="store_true",               help="Ablation: disable v compression (use fp32 v)")
-    p.add_argument("--null_pct",           type=float, default=0.10,          help="CoState null threshold percentile (default 0.10)")
-    p.add_argument("--amp_pct",            type=float, default=0.90,          help="CoState amplitude threshold percentile (default 0.90)")
-    p.add_argument("--error_feedback",     action="store_true",               help="Enable CoState error feedback")
-    p.add_argument("--no_amp",             action="store_true",               help="Disable AMP mixed precision")
+    p.add_argument(
+        "--v_bits",
+        type=int,
+        default=4,
+        help="Bits per element for v compression: 4, 6, 8, or 16 (default 4)",
+    )
+    p.add_argument(
+        "--no_compress_m",
+        action="store_true",
+        help="Ablation: disable CoState m compression (use fp32 m)",
+    )
+    p.add_argument(
+        "--no_compress_v",
+        action="store_true",
+        help="Ablation: disable v compression (use fp32 v)",
+    )
+    p.add_argument(
+        "--null_pct",
+        type=float,
+        default=0.10,
+        help="CoState null threshold percentile (default 0.10)",
+    )
+    p.add_argument(
+        "--amp_pct",
+        type=float,
+        default=0.90,
+        help="CoState amplitude threshold percentile (default 0.90)",
+    )
+    p.add_argument(
+        "--error_feedback", action="store_true", help="Enable CoState error feedback"
+    )
+    p.add_argument("--no_amp", action="store_true", help="Disable AMP mixed precision")
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
 # Device selection
 # ---------------------------------------------------------------------------
+
 
 def select_device(requested: str | None) -> torch.device:
     if requested:
@@ -65,6 +119,7 @@ def select_device(requested: str | None) -> torch.device:
 # Learning rate schedule: linear warmup + cosine decay
 # ---------------------------------------------------------------------------
 
+
 def get_lr(step: int, warmup_steps: int, total_steps: int, peak_lr: float) -> float:
     if step < warmup_steps:
         return peak_lr * step / max(1, warmup_steps)
@@ -76,6 +131,7 @@ def get_lr(step: int, warmup_steps: int, total_steps: int, peak_lr: float) -> fl
 # ---------------------------------------------------------------------------
 # Dataset construction
 # ---------------------------------------------------------------------------
+
 
 def load_chunks(cache_path: str) -> list:
     """Load pre-tokenized chunks from a .pt file (list of 512-token tensors)."""
@@ -101,17 +157,19 @@ class ChunkDataset(torch.utils.data.Dataset):
 # Gradient norm
 # ---------------------------------------------------------------------------
 
+
 def compute_grad_norm(model: nn.Module) -> float:
     total = 0.0
     for p in model.parameters():
         if p.grad is not None:
             total += p.grad.data.norm(2).item() ** 2
-    return total ** 0.5
+    return total**0.5
 
 
 # ---------------------------------------------------------------------------
 # TurboAdam state inspection helpers
 # ---------------------------------------------------------------------------
+
 
 def count_compressed_params(optimizer: TurboAdam) -> int:
     """Count how many parameters have compressed v state."""
@@ -163,6 +221,7 @@ def get_costate_fractions(optimizer: TurboAdam) -> dict | None:
 # Main training loop
 # ---------------------------------------------------------------------------
 
+
 def main():
     args = parse_args()
 
@@ -177,7 +236,7 @@ def main():
     device = select_device(args.device)
     print(f"Device: {device}")
 
-    use_amp = (device.type == "cuda") and not getattr(args, 'no_amp', False)
+    use_amp = (device.type == "cuda") and not getattr(args, "no_amp", False)
     # MPS and CPU run in native precision
     print(f"Mixed precision (AMP): {use_amp}")
 
@@ -208,7 +267,9 @@ def main():
         chunks = load_chunks(args.cache_path)
     else:
         from datasets import load_dataset
+
         print("No --cache_path provided, streaming WikiText-103 from HuggingFace…")
+
         def _build_token_chunks(tokenizer, seq_len, split="train"):
             dataset = load_dataset("wikitext", "wikitext-103-raw-v1", split=split)
             token_ids = []
@@ -225,13 +286,14 @@ def main():
                 if len(chunk) == seq_len + 1:
                     chunks.append(torch.tensor(chunk, dtype=torch.long))
             return chunks
+
         chunks = _build_token_chunks(tokenizer, args.seq_len)
     dataset = ChunkDataset(chunks)
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,       # keep simple; avoids multiprocessing issues on MPS
+        num_workers=0,  # keep simple; avoids multiprocessing issues on MPS
         pin_memory=(device.type == "cuda"),
         generator=torch.Generator().manual_seed(args.seed),
         drop_last=True,
@@ -276,9 +338,11 @@ def main():
 
     log_entries = []
 
-    print(f"\nTraining for {args.steps} steps  "
-          f"(micro-batch={args.batch_size}, accum={args.accum_steps}, "
-          f"eff-batch={args.batch_size * args.accum_steps})")
+    print(
+        f"\nTraining for {args.steps} steps  "
+        f"(micro-batch={args.batch_size}, accum={args.accum_steps}, "
+        f"eff-batch={args.batch_size * args.accum_steps})"
+    )
 
     t_start = time.time()
 

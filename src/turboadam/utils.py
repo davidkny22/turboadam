@@ -13,7 +13,6 @@ Block helpers:
   unpad_from_blocks(padded, original_length) -> tensor
 """
 
-import math
 import torch
 
 BLOCK_SIZE = 128

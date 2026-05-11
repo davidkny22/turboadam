@@ -56,7 +56,9 @@ def quantize_logscale(
     # Normalize to [0, 1] range within each block
     normalized = (log_blocks - log_min.unsqueeze(1)) / span  # (num_blocks, block_size)
     # Map to bucket index 0-3
-    indices = (normalized * 4.0).clamp(0, 3.999).to(torch.long)  # (num_blocks, block_size)
+    indices = (
+        (normalized * 4.0).clamp(0, 3.999).to(torch.long)
+    )  # (num_blocks, block_size)
 
     # Pack 4 x 2-bit indices into each uint8 byte
     indices_flat = indices.reshape(-1)  # (total_elements,)
@@ -120,6 +122,7 @@ def dequantize_logscale(
 # Generalized n-bit log-scale quantization
 # ---------------------------------------------------------------------------
 
+
 def quantize_logscale_nbits(
     v_flat: torch.Tensor,
     n_bits: int = 3,
@@ -149,7 +152,7 @@ def quantize_logscale_nbits(
     assert v_flat.ndim == 1
     assert v_flat.shape[0] % block_size == 0
     num_blocks = v_flat.shape[0] // block_size
-    n_buckets = 2 ** n_bits
+    n_buckets = 2**n_bits
 
     blocks = v_flat.reshape(num_blocks, block_size)
     log_blocks = blocks.clamp(min=1e-38).log()
@@ -166,7 +169,11 @@ def quantize_logscale_nbits(
         floor_idx = continuous.floor()
         frac = continuous - floor_idx
         # Round up with probability equal to fractional part (unbiased)
-        indices = (floor_idx + (torch.rand_like(frac) < frac).float()).clamp(0, n_buckets - 1).to(torch.uint8)
+        indices = (
+            (floor_idx + (torch.rand_like(frac) < frac).float())
+            .clamp(0, n_buckets - 1)
+            .to(torch.uint8)
+        )
     else:
         indices = continuous.clamp(0, n_buckets - 0.001).to(torch.uint8)
 
@@ -195,7 +202,7 @@ def dequantize_logscale_nbits(
     num_blocks = scales.shape[0]
     if original_numel == 0:
         original_numel = num_blocks * block_size
-    n_buckets = 2 ** n_bits
+    n_buckets = 2**n_bits
 
     idx = indices.to(torch.long).reshape(num_blocks, block_size)
 
@@ -210,6 +217,7 @@ def dequantize_logscale_nbits(
 # ---------------------------------------------------------------------------
 # Fused decompress → EMA → recompress (avoids redundant pad/reshape cycles)
 # ---------------------------------------------------------------------------
+
 
 def fused_v_update(
     indices: torch.Tensor,
@@ -238,7 +246,7 @@ def fused_v_update(
         (trimmed to original_numel) for denominator computation.
     """
     num_blocks = scales.shape[0]
-    n_buckets = 2 ** n_bits
+    n_buckets = 2**n_bits
 
     # --- Decompress in block layout (stay in blocks, no reshape to param shape) ---
     idx = indices.to(torch.long).reshape(num_blocks, block_size)
@@ -253,7 +261,7 @@ def fused_v_update(
     padded_len = num_blocks * block_size
     if g_flat.shape[0] < padded_len:
         g_sq = torch.zeros(padded_len, dtype=torch.float32, device=g_flat.device)
-        g_sq[:g_flat.shape[0]] = g_flat * g_flat
+        g_sq[: g_flat.shape[0]] = g_flat * g_flat
     else:
         g_sq = g_flat * g_flat
     g_sq_blocks = g_sq.reshape(num_blocks, block_size)
@@ -268,8 +276,8 @@ def fused_v_update(
     block_indices = torch.arange(num_blocks, device=v_blocks.device).unsqueeze(1)
     elem_indices = torch.arange(block_size, device=v_blocks.device).unsqueeze(0)
     valid_mask = (block_indices * block_size + elem_indices) < original_numel
-    new_log_min = log_blocks.masked_fill(~valid_mask, float('inf')).min(dim=1).values
-    new_log_max = log_blocks.masked_fill(~valid_mask, float('-inf')).max(dim=1).values
+    new_log_min = log_blocks.masked_fill(~valid_mask, float("inf")).min(dim=1).values
+    new_log_max = log_blocks.masked_fill(~valid_mask, float("-inf")).max(dim=1).values
     new_scales = torch.stack([new_log_min, new_log_max], dim=1).to(torch.float16)
 
     new_span = (new_log_max - new_log_min).unsqueeze(1).clamp(min=1e-10)
@@ -279,7 +287,11 @@ def fused_v_update(
     # Stochastic rounding
     floor_idx = continuous.floor()
     frac = continuous - floor_idx
-    new_indices = (floor_idx + (torch.rand_like(frac) < frac).float()).clamp(0, n_buckets - 1).to(torch.uint8)
+    new_indices = (
+        (floor_idx + (torch.rand_like(frac) < frac).float())
+        .clamp(0, n_buckets - 1)
+        .to(torch.uint8)
+    )
 
     # Return flat v (trimmed) for denominator computation
     v_flat = v_blocks.reshape(-1)[:original_numel]

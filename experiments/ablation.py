@@ -17,7 +17,6 @@ import os
 import time
 
 import torch
-import torch.nn as nn
 
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -26,19 +25,30 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 def parse_args():
     p = argparse.ArgumentParser(description="TurboAdam ablation sweep")
     # Mode
-    p.add_argument("--mode", type=str, default="combined",
-                   choices=["baseline", "combined", "costate_only", "1q_only", "no_compression"],
-                   help="Optimizer mode")
+    p.add_argument(
+        "--mode",
+        type=str,
+        default="combined",
+        choices=["baseline", "combined", "costate_only", "1q_only", "no_compression"],
+        help="Optimizer mode",
+    )
     # TurboAdam hyperparameters
     p.add_argument("--block_size", type=int, default=128)
-    p.add_argument("--v_bits", type=int, default=4,
-                   help="Bits for v compression: 4, 6, 8, or 16")
-    p.add_argument("--null_pct", type=float, default=0.10,
-                   help="CoState null threshold percentile")
-    p.add_argument("--amp_pct", type=float, default=0.90,
-                   help="CoState amplitude threshold percentile")
-    p.add_argument("--error_feedback", action="store_true",
-                   help="Enable CoState error feedback")
+    p.add_argument(
+        "--v_bits", type=int, default=4, help="Bits for v compression: 4, 6, 8, or 16"
+    )
+    p.add_argument(
+        "--null_pct", type=float, default=0.10, help="CoState null threshold percentile"
+    )
+    p.add_argument(
+        "--amp_pct",
+        type=float,
+        default=0.90,
+        help="CoState amplitude threshold percentile",
+    )
+    p.add_argument(
+        "--error_feedback", action="store_true", help="Enable CoState error feedback"
+    )
     # Training
     p.add_argument("--steps", type=int, default=500)
     p.add_argument("--batch_size", type=int, default=4)
@@ -106,52 +116,73 @@ def compute_grad_norm(model):
     for p in model.parameters():
         if p.grad is not None:
             total += p.grad.data.norm(2).item() ** 2
-    return total ** 0.5
+    return total**0.5
 
 
 def make_optimizer(mode, model, args):
     """Create optimizer based on mode."""
     if mode == "baseline":
         return torch.optim.AdamW(
-            model.parameters(), lr=args.lr,
-            betas=(0.9, 0.999), weight_decay=0.01, eps=1e-8,
+            model.parameters(),
+            lr=args.lr,
+            betas=(0.9, 0.999),
+            weight_decay=0.01,
+            eps=1e-8,
         )
 
     from turboadam import TurboAdam
 
     if mode == "costate_only":
         return TurboAdam(
-            model.parameters(), lr=args.lr,
-            betas=(0.9, 0.999), weight_decay=0.01, eps=1e-8,
+            model.parameters(),
+            lr=args.lr,
+            betas=(0.9, 0.999),
+            weight_decay=0.01,
+            eps=1e-8,
             block_size=args.block_size,
-            compress_m=True, compress_v=False,
-            null_pct=args.null_pct, amp_pct=args.amp_pct,
+            compress_m=True,
+            compress_v=False,
+            null_pct=args.null_pct,
+            amp_pct=args.amp_pct,
             error_feedback=args.error_feedback,
         )
     elif mode == "1q_only":
         return TurboAdam(
-            model.parameters(), lr=args.lr,
-            betas=(0.9, 0.999), weight_decay=0.01, eps=1e-8,
+            model.parameters(),
+            lr=args.lr,
+            betas=(0.9, 0.999),
+            weight_decay=0.01,
+            eps=1e-8,
             block_size=args.block_size,
-            compress_m=False, compress_v=True,
+            compress_m=False,
+            compress_v=True,
             v_bits=args.v_bits,
         )
     elif mode == "no_compression":
         return TurboAdam(
-            model.parameters(), lr=args.lr,
-            betas=(0.9, 0.999), weight_decay=0.01, eps=1e-8,
+            model.parameters(),
+            lr=args.lr,
+            betas=(0.9, 0.999),
+            weight_decay=0.01,
+            eps=1e-8,
             block_size=args.block_size,
-            compress_m=False, compress_v=False,
+            compress_m=False,
+            compress_v=False,
         )
     else:
         # combined (default)
         return TurboAdam(
-            model.parameters(), lr=args.lr,
-            betas=(0.9, 0.999), weight_decay=0.01, eps=1e-8,
+            model.parameters(),
+            lr=args.lr,
+            betas=(0.9, 0.999),
+            weight_decay=0.01,
+            eps=1e-8,
             block_size=args.block_size,
             v_bits=args.v_bits,
-            compress_m=True, compress_v=True,
-            null_pct=args.null_pct, amp_pct=args.amp_pct,
+            compress_m=True,
+            compress_v=True,
+            null_pct=args.null_pct,
+            amp_pct=args.amp_pct,
             error_feedback=args.error_feedback,
         )
 
@@ -162,12 +193,14 @@ def main():
         args.steps = 5
     torch.manual_seed(args.seed)
     device = select_device(args.device)
-    use_amp = (device.type == "cuda")
+    use_amp = device.type == "cuda"
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Parameterized log filename
-    tag = (f"ablation_{args.mode}_bs{args.block_size}_vb{args.v_bits}"
-           f"_np{args.null_pct}_ap{args.amp_pct}")
+    tag = (
+        f"ablation_{args.mode}_bs{args.block_size}_vb{args.v_bits}"
+        f"_np{args.null_pct}_ap{args.amp_pct}"
+    )
     log_path = os.path.join(args.output_dir, f"{tag}.jsonl")
     print(f"Mode: {args.mode} | Log: {log_path}")
 
@@ -178,9 +211,13 @@ def main():
     chunks = build_token_chunks(tokenizer, args.seq_len)
     dataset = ChunkDataset(chunks)
     loader = torch.utils.data.DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, num_workers=0,
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=0,
         pin_memory=(device.type == "cuda"),
-        generator=torch.Generator().manual_seed(args.seed), drop_last=True,
+        generator=torch.Generator().manual_seed(args.seed),
+        drop_last=True,
     )
 
     optimizer = make_optimizer(args.mode, model, args)
@@ -243,14 +280,19 @@ def main():
             if step % args.log_every == 0 or step == 1:
                 avg_loss = running_loss / args.log_every if step > 1 else running_loss
                 entry = {
-                    "step": step, "loss": loss.item() * args.accum_steps,
-                    "avg_loss": avg_loss, "lr": lr_now,
-                    "grad_norm": grad_norm, "elapsed_s": time.time() - t0,
+                    "step": step,
+                    "loss": loss.item() * args.accum_steps,
+                    "avg_loss": avg_loss,
+                    "lr": lr_now,
+                    "grad_norm": grad_norm,
+                    "elapsed_s": time.time() - t0,
                     "mode": args.mode,
                 }
                 log_entries.append(entry)
-                print(f"[{args.mode}] step={step} loss={entry['loss']:.4f} "
-                      f"avg={avg_loss:.4f} lr={lr_now:.6f} grad={grad_norm:.2f}")
+                print(
+                    f"[{args.mode}] step={step} loss={entry['loss']:.4f} "
+                    f"avg={avg_loss:.4f} lr={lr_now:.6f} grad={grad_norm:.2f}"
+                )
                 running_loss = 0.0
 
     with open(log_path, "w") as f:

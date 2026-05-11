@@ -6,7 +6,6 @@ Covers:
 - End-to-end: 100 optimizer steps, loss convergence vs. standard Adam
 """
 
-import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,13 +13,13 @@ import torch.nn.functional as F
 from turboadam import TurboAdam
 from turboadam.quantize import quantize_logscale, dequantize_logscale
 from turboadam.costate import CoStateManager
-from turboadam.utils import pad_to_blocks
 from turboadam.oneq import decompress_v
 
 
 # ---------------------------------------------------------------------------
 # 1. Per-component compression roundtrip
 # ---------------------------------------------------------------------------
+
 
 class TestQuantizeRoundtrip:
     """Quantize/dequantize on a [512] bias-like positive tensor."""
@@ -42,7 +41,7 @@ class TestQuantizeRoundtrip:
 
         # Relative MSE: mean((v - v_hat)^2) / mean(v^2)
         mse = ((v - v_hat) ** 2).mean().item()
-        v_sq_mean = (v ** 2).mean().item()
+        v_sq_mean = (v**2).mean().item()
         relative_mse = mse / (v_sq_mean + 1e-30)
 
         assert relative_mse < 0.15, (
@@ -114,8 +113,12 @@ class TestCoStateRoundtrip:
         validated via convergence in TestFullOptimizerVsAdam.
         """
         from turboadam.costate import (
-            decompose, compute_block_ratios, compute_thresholds,
-            classify_blocks, encode_blocks, decode_blocks,
+            decompose,
+            compute_block_ratios,
+            compute_thresholds,
+            classify_blocks,
+            encode_blocks,
+            decode_blocks,
         )
 
         torch.manual_seed(20)
@@ -135,7 +138,9 @@ class TestCoStateRoundtrip:
         tau0, tau1 = compute_thresholds(ratios)
         labels = classify_blocks(ratios, tau0, tau1)
         encoded = encode_blocks(delta, labels, block_size=block_size)
-        m_hat = decode_blocks(encoded, alpha, g, block_size=block_size, original_numel=numel)
+        m_hat = decode_blocks(
+            encoded, alpha, g, block_size=block_size, original_numel=numel
+        )
 
         cos_sim = F.cosine_similarity(
             m.reshape(1, -1),
@@ -168,7 +173,7 @@ class TestCoStateRoundtrip:
 
         # Norm should be bounded — not more than 50x the gradient scale * numel^0.5
         final_norm = m_outputs[-1].norm().item()
-        expected_max_norm = 50.0 * g_scale * (numel ** 0.5)
+        expected_max_norm = 50.0 * g_scale * (numel**0.5)
         assert final_norm < expected_max_norm, (
             f"CoState m norm {final_norm:.4f} exceeds expected bound {expected_max_norm:.4f} "
             f"(potential divergence)"
@@ -208,7 +213,6 @@ class TestCoStateRoundtrip:
     def test_costate_output_shape_matches_input(self):
         """CoState update output should have same shape as input gradient."""
         torch.manual_seed(22)
-        mgr = CoStateManager(block_size=128)
 
         for shape in [(256,), (64, 64)]:
             mgr_local = CoStateManager(block_size=128)
@@ -223,6 +227,7 @@ class TestCoStateRoundtrip:
 # ---------------------------------------------------------------------------
 # 2. Full optimizer vs Adam on MLP
 # ---------------------------------------------------------------------------
+
 
 class _SimpleMLP(nn.Module):
     """2-layer MLP: 128 → 64 → 1."""
@@ -307,7 +312,9 @@ class TestFullOptimizerVsAdam:
 
         # Within 20% relative difference
         # Use symmetric relative difference: |a - b| / max(|a|, |b|)
-        rel_diff = abs(adam_final - turbo_final) / (max(abs(adam_final), abs(turbo_final)) + 1e-8)
+        rel_diff = abs(adam_final - turbo_final) / (
+            max(abs(adam_final), abs(turbo_final)) + 1e-8
+        )
 
         assert rel_diff < 0.80, (
             f"Final loss relative difference {rel_diff:.4f} exceeds 80% tolerance. "
@@ -336,6 +343,7 @@ class TestFullOptimizerVsAdam:
 # ---------------------------------------------------------------------------
 # 3. Compress-every-step state structure
 # ---------------------------------------------------------------------------
+
 
 class TestCompressEveryStep:
     """Verify state structure with the compress-every-step v architecture."""
@@ -393,6 +401,7 @@ class TestCompressEveryStep:
 # 4. Smooth loss trajectory (no spikes from compress-every-step)
 # ---------------------------------------------------------------------------
 
+
 class TestSmoothLoss:
     """Verify compress-every-step produces smooth loss without spikes."""
 
@@ -444,5 +453,5 @@ class TestSmoothLoss:
     def test_no_nan(self):
         """200 steps should complete without NaN."""
         losses = self._run_with_losses(n_steps=200)
-        nan_steps = [i + 1 for i, l in enumerate(losses) if l != l]
+        nan_steps = [i + 1 for i, loss in enumerate(losses) if loss != loss]
         assert not nan_steps, f"NaN losses at steps: {nan_steps}"

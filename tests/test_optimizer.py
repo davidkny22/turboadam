@@ -8,20 +8,18 @@ Covers:
 - Ablation flags (compress_m, compress_v)
 """
 
-import copy
-
 import pytest
 import torch
 import torch.nn as nn
 
 from turboadam import TurboAdam
-from turboadam.costate import CoStateManager
 from turboadam.oneq import decompress_v
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 def _make_params(seed=42):
     """Return a list of parameters initialized from a fixed seed."""
@@ -43,10 +41,13 @@ def _step_with_grad(opt, params):
 # 1. API compatibility
 # ---------------------------------------------------------------------------
 
+
 class TestAPICompatibility:
     def test_accepts_adam_args(self):
         params = _make_params()
-        opt = TurboAdam(params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2)
+        opt = TurboAdam(
+            params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2
+        )
         assert opt.defaults["lr"] == 1e-3
         assert opt.defaults["betas"] == (0.9, 0.999)
         assert opt.defaults["eps"] == 1e-8
@@ -82,6 +83,7 @@ class TestAPICompatibility:
 # 2. Convergence on quadratic f(x) = sum(x^2)
 # ---------------------------------------------------------------------------
 
+
 class TestConvergence:
     def test_converges_quadratic_200_steps(self):
         """TurboAdam should drive sum(x^2) close to 0 within 200 steps."""
@@ -89,14 +91,14 @@ class TestConvergence:
         x = nn.Parameter(torch.randn(50))
         opt = TurboAdam([x], lr=1e-2)
 
-        initial_loss = (x ** 2).sum().item()
+        initial_loss = (x**2).sum().item()
         for _ in range(200):
             opt.zero_grad()
-            loss = (x ** 2).sum()
+            loss = (x**2).sum()
             loss.backward()
             opt.step()
 
-        final_loss = (x ** 2).sum().item()
+        final_loss = (x**2).sum().item()
         assert final_loss < 0.10 * initial_loss, (
             f"Expected final_loss < 10% of initial, "
             f"got initial={initial_loss:.4f}, final={final_loss:.6f}"
@@ -108,20 +110,21 @@ class TestConvergence:
         x = nn.Parameter(torch.randn(50))
         opt = TurboAdam([x], lr=1e-2, compress_m=False, compress_v=False)
 
-        initial_loss = (x ** 2).sum().item()
+        initial_loss = (x**2).sum().item()
         for _ in range(200):
             opt.zero_grad()
-            loss = (x ** 2).sum()
+            loss = (x**2).sum()
             loss.backward()
             opt.step()
 
-        final_loss = (x ** 2).sum().item()
+        final_loss = (x**2).sum().item()
         assert final_loss < 0.10 * initial_loss
 
 
 # ---------------------------------------------------------------------------
 # 3. State structure — compressed v and CoState m
 # ---------------------------------------------------------------------------
+
 
 class TestStateStructure:
     def test_compressed_v_present_after_first_step(self):
@@ -231,6 +234,7 @@ class TestStateStructure:
 # 4. Closeness to standard Adam
 # ---------------------------------------------------------------------------
 
+
 class TestAdamComparison:
     def _run_optimizer(self, opt_class, params, grads_sequence, opt_kwargs=None):
         """Run optimizer for len(grads_sequence) steps, return final param values."""
@@ -256,14 +260,23 @@ class TestAdamComparison:
         torch.manual_seed(42)
         adam_params = [nn.Parameter(torch.ones(10, 10)), nn.Parameter(torch.ones(20))]
         adam_results = self._run_optimizer(
-            torch.optim.Adam, adam_params, grad_sequence, opt_kwargs={"betas": (0.9, 0.999)}
+            torch.optim.Adam,
+            adam_params,
+            grad_sequence,
+            opt_kwargs={"betas": (0.9, 0.999)},
         )
 
         torch.manual_seed(42)
         turbo_params = [nn.Parameter(torch.ones(10, 10)), nn.Parameter(torch.ones(20))]
         turbo_results = self._run_optimizer(
-            TurboAdam, turbo_params, grad_sequence,
-            opt_kwargs={"betas": (0.9, 0.999), "compress_m": False, "compress_v": False},
+            TurboAdam,
+            turbo_params,
+            grad_sequence,
+            opt_kwargs={
+                "betas": (0.9, 0.999),
+                "compress_m": False,
+                "compress_v": False,
+            },
         )
 
         for i, (a_val, t_val) in enumerate(zip(adam_results, turbo_results)):
@@ -284,7 +297,10 @@ class TestAdamComparison:
         torch.manual_seed(42)
         adam_params = [nn.Parameter(torch.ones(10, 10)), nn.Parameter(torch.ones(20))]
         adam_results = self._run_optimizer(
-            torch.optim.Adam, adam_params, grad_sequence, opt_kwargs={"betas": (0.9, 0.999)}
+            torch.optim.Adam,
+            adam_params,
+            grad_sequence,
+            opt_kwargs={"betas": (0.9, 0.999)},
         )
 
         torch.manual_seed(42)
@@ -309,12 +325,15 @@ class TestAdamComparison:
         opt = TurboAdam([x], lr=1e-2)
         x.grad = torch.ones(10)
         opt.step()
-        assert not torch.allclose(x.data, initial), "Parameters did not change after step"
+        assert not torch.allclose(x.data, initial), (
+            "Parameters did not change after step"
+        )
 
 
 # ---------------------------------------------------------------------------
 # 5. Weight decay
 # ---------------------------------------------------------------------------
+
 
 class TestWeightDecay:
     def test_weight_decay_reduces_params(self):
@@ -331,6 +350,7 @@ class TestWeightDecay:
 # ---------------------------------------------------------------------------
 # 6. Multiple param groups
 # ---------------------------------------------------------------------------
+
 
 class TestParamGroups:
     def test_multiple_param_groups(self):
@@ -354,6 +374,7 @@ class TestParamGroups:
 # ---------------------------------------------------------------------------
 # 7. V compression quality
 # ---------------------------------------------------------------------------
+
 
 class TestVCompression:
     def test_compressed_v_nonnegative(self):
@@ -393,14 +414,14 @@ class TestVCompression:
             x = nn.Parameter(torch.randn(50))
             opt = TurboAdam([x], lr=1e-2, v_bits=bits)
 
-            initial_loss = (x ** 2).sum().item()
+            initial_loss = (x**2).sum().item()
             for _ in range(500):
                 opt.zero_grad()
-                loss = (x ** 2).sum()
+                loss = (x**2).sum()
                 loss.backward()
                 opt.step()
 
-            final_loss = (x ** 2).sum().item()
+            final_loss = (x**2).sum().item()
             assert final_loss < 0.10 * initial_loss, (
                 f"Failed to converge at {bits}-bit: "
                 f"initial={initial_loss:.4f}, final={final_loss:.6f}"
@@ -411,6 +432,7 @@ class TestVCompression:
 # 8. Ablation flags
 # ---------------------------------------------------------------------------
 
+
 class TestAblationFlags:
     def test_compress_m_only(self):
         """compress_m=True, compress_v=False should work (CoState only)."""
@@ -418,14 +440,14 @@ class TestAblationFlags:
         x = nn.Parameter(torch.randn(50))
         opt = TurboAdam([x], lr=1e-2, compress_m=True, compress_v=False)
 
-        initial_loss = (x ** 2).sum().item()
+        initial_loss = (x**2).sum().item()
         for _ in range(200):
             opt.zero_grad()
-            loss = (x ** 2).sum()
+            loss = (x**2).sum()
             loss.backward()
             opt.step()
 
-        final_loss = (x ** 2).sum().item()
+        final_loss = (x**2).sum().item()
         assert final_loss < 0.10 * initial_loss
 
     def test_compress_v_only(self):
@@ -434,14 +456,14 @@ class TestAblationFlags:
         x = nn.Parameter(torch.randn(50))
         opt = TurboAdam([x], lr=1e-2, compress_m=False, compress_v=True)
 
-        initial_loss = (x ** 2).sum().item()
+        initial_loss = (x**2).sum().item()
         for _ in range(200):
             opt.zero_grad()
-            loss = (x ** 2).sum()
+            loss = (x**2).sum()
             loss.backward()
             opt.step()
 
-        final_loss = (x ** 2).sum().item()
+        final_loss = (x**2).sum().item()
         assert final_loss < 0.10 * initial_loss
 
     def test_no_compression(self):
@@ -450,20 +472,21 @@ class TestAblationFlags:
         x = nn.Parameter(torch.randn(50))
         opt = TurboAdam([x], lr=1e-2, compress_m=False, compress_v=False)
 
-        initial_loss = (x ** 2).sum().item()
+        initial_loss = (x**2).sum().item()
         for _ in range(200):
             opt.zero_grad()
-            loss = (x ** 2).sum()
+            loss = (x**2).sum()
             loss.backward()
             opt.step()
 
-        final_loss = (x ** 2).sum().item()
+        final_loss = (x**2).sum().item()
         assert final_loss < 0.10 * initial_loss
 
 
 # ---------------------------------------------------------------------------
 # 9. Closure support
 # ---------------------------------------------------------------------------
+
 
 class TestClosure:
     def test_closure_returns_loss(self):
@@ -474,7 +497,7 @@ class TestClosure:
 
         def closure():
             opt.zero_grad()
-            loss = (x ** 2).sum()
+            loss = (x**2).sum()
             loss.backward()
             return loss
 
@@ -487,6 +510,7 @@ class TestClosure:
 # 10. State dict roundtrip
 # ---------------------------------------------------------------------------
 
+
 class TestStateDict:
     def test_state_dict_roundtrip_matches_continuous(self):
         """Save → load → step should match continuous run."""
@@ -498,7 +522,7 @@ class TestStateDict:
         # Run 5 steps
         for _ in range(5):
             opt.zero_grad()
-            loss = (x ** 2 + y ** 2).sum()
+            loss = (x**2 + y**2).sum()
             loss.backward()
             opt.step()
 
@@ -514,12 +538,12 @@ class TestStateDict:
         # Run 3 more steps on both
         for _ in range(3):
             opt.zero_grad()
-            loss = (x ** 2 + y ** 2).sum()
+            loss = (x**2 + y**2).sum()
             loss.backward()
             opt.step()
 
             opt2.zero_grad()
-            loss2 = (x2 ** 2 + y2 ** 2).sum()
+            loss2 = (x2**2 + y2**2).sum()
             loss2.backward()
             opt2.step()
 
@@ -536,7 +560,7 @@ class TestStateDict:
         opt = TurboAdam([x], lr=1e-2)
 
         opt.zero_grad()
-        (x ** 2).sum().backward()
+        (x**2).sum().backward()
         opt.step()
 
         state = opt.state_dict()
@@ -548,13 +572,14 @@ class TestStateDict:
 
         # Should be able to step without device errors
         opt2.zero_grad()
-        (x2 ** 2).sum().backward()
+        (x2**2).sum().backward()
         opt2.step()
 
 
 # ---------------------------------------------------------------------------
 # 11. Mixed precision
 # ---------------------------------------------------------------------------
+
 
 class TestMixedPrecision:
     def test_fp16_gradients(self):
@@ -564,7 +589,7 @@ class TestMixedPrecision:
         opt = TurboAdam([x], lr=1e-2, v_bits=4)
 
         opt.zero_grad()
-        (x ** 2).sum().backward()
+        (x**2).sum().backward()
         opt.step()
 
         assert not torch.isnan(x).any()
@@ -579,7 +604,7 @@ class TestMixedPrecision:
 
         opt.zero_grad()
         with torch.autocast("cuda"):
-            loss = (x ** 2).sum()
+            loss = (x**2).sum()
         loss.backward()
         opt.step()
 
@@ -590,6 +615,7 @@ class TestMixedPrecision:
 # 12. Gradient accumulation
 # ---------------------------------------------------------------------------
 
+
 class TestGradientAccumulation:
     def test_step_increments_once_per_accumulation(self):
         """step() should increment step counter once after multiple backward()."""
@@ -599,14 +625,14 @@ class TestGradientAccumulation:
 
         # Trigger lazy init with one step first
         opt.zero_grad()
-        (x ** 2).sum().backward()
+        (x**2).sum().backward()
         opt.step()
         assert opt.state[x]["step"] == 1
 
         # 3 backward calls without step
         for _ in range(3):
             opt.zero_grad(set_to_none=False)
-            (x ** 2).sum().backward()
+            (x**2).sum().backward()
 
         # Step counter should still be 1 before next step
         assert opt.state[x]["step"] == 1
@@ -638,6 +664,7 @@ class TestGradientAccumulation:
 # 13. add_param_group
 # ---------------------------------------------------------------------------
 
+
 class TestAddParamGroup:
     def test_add_param_group_does_not_break_bias_correction(self):
         """Adding a new parameter group mid-training should work."""
@@ -649,7 +676,7 @@ class TestAddParamGroup:
         # Step a few times
         for _ in range(5):
             opt.zero_grad()
-            (x ** 2).sum().backward()
+            (x**2).sum().backward()
             opt.step()
 
         # Add new parameter group
@@ -657,7 +684,7 @@ class TestAddParamGroup:
 
         # Step with both parameters
         opt.zero_grad()
-        (x ** 2 + y ** 2).sum().backward()
+        (x**2 + y**2).sum().backward()
         opt.step()
 
         # Both should have stepped without error
@@ -685,6 +712,7 @@ class TestAddParamGroup:
 # 14. Constructor validation
 # ---------------------------------------------------------------------------
 
+
 class TestConstructorValidation:
     def test_capturable_true_raises(self):
         """capturable=True should raise NotImplementedError."""
@@ -697,7 +725,7 @@ class TestConstructorValidation:
         x = nn.Parameter(torch.randn(100))  # 100 elements
         opt = TurboAdam([x], min_m_compress_elements=200)
         opt.zero_grad()
-        (x ** 2).sum().backward()
+        (x**2).sum().backward()
         opt.step()
         assert "exp_avg" in opt.state[x]  # fp32 m, not CoState
         assert "m_mgr" not in opt.state[x]
@@ -708,7 +736,7 @@ class TestConstructorValidation:
         x = nn.Parameter(torch.randn(5000))  # 5000 elements
         opt = TurboAdam([x], min_m_compress_elements=100)
         opt.zero_grad()
-        (x ** 2).sum().backward()
+        (x**2).sum().backward()
         opt.step()
         assert "m_mgr" in opt.state[x]  # CoState manager
         assert "exp_avg" not in opt.state[x]

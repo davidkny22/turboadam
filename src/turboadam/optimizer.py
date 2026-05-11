@@ -4,12 +4,13 @@ import torch
 from torch.optim import Optimizer
 
 from turboadam.costate import CoStateManager
-from turboadam.oneq import compress_v_logscale, decompress_v
+from turboadam.oneq import compress_v_logscale
 from turboadam.quantize import fused_v_update
 
 # Try to use Triton-accelerated kernels; fall back to PyTorch if unavailable
 try:
     from turboadam.triton_kernels import triton_fused_v_update as _triton_v_update
+
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
@@ -119,7 +120,11 @@ class TurboAdam(Optimizer):
                 # --- v update ---
                 if use_compress_v:
                     cv = state["compressed_v"]
-                    _v_update_fn = _triton_v_update if (_HAS_TRITON and grad.is_cuda) else fused_v_update
+                    _v_update_fn = (
+                        _triton_v_update
+                        if (_HAS_TRITON and grad.is_cuda)
+                        else fused_v_update
+                    )
                     if _HAS_TRITON and grad.is_cuda:
                         # Refill random buffer for stochastic rounding (graph-safe:
                         # same tensor address, only contents change)
@@ -129,8 +134,13 @@ class TurboAdam(Optimizer):
                         _new_indices = torch.empty_like(cv["indices"])
                         _new_scales = torch.empty_like(cv["scales"])
                         new_indices, new_scales, v_flat = _v_update_fn(
-                            cv["indices"], cv["scales"], grad, beta2,
-                            cv["n_bits"], cv["block_size"], cv["original_length"],
+                            cv["indices"],
+                            cv["scales"],
+                            grad,
+                            beta2,
+                            cv["n_bits"],
+                            cv["block_size"],
+                            cv["original_length"],
                             rand_buf=cv["rand_buf"],
                             out_indices=_new_indices,
                             out_scales=_new_scales,
@@ -139,8 +149,13 @@ class TurboAdam(Optimizer):
                         cv["scales"] = new_scales
                     else:
                         new_indices, new_scales, v_flat = _v_update_fn(
-                            cv["indices"], cv["scales"], grad, beta2,
-                            cv["n_bits"], cv["block_size"], cv["original_length"],
+                            cv["indices"],
+                            cv["scales"],
+                            grad,
+                            beta2,
+                            cv["n_bits"],
+                            cv["block_size"],
+                            cv["original_length"],
                         )
                         cv["indices"] = new_indices
                         cv["scales"] = new_scales
@@ -166,9 +181,11 @@ class TurboAdam(Optimizer):
                 if p not in self.state:
                     continue
                 state = self.state[p]
-                next_step = state["step"] + 1  # step increments inside _full_step_kernel
-                state["_bc1"].fill_(1.0 - beta1 ** next_step)
-                state["_bc2"].fill_(1.0 - beta2 ** next_step)
+                next_step = (
+                    state["step"] + 1
+                )  # step increments inside _full_step_kernel
+                state["_bc1"].fill_(1.0 - beta1**next_step)
+                state["_bc2"].fill_(1.0 - beta2**next_step)
 
     # ------------------------------------------------------------------
     # State dict handling
@@ -226,7 +243,9 @@ class TurboAdam(Optimizer):
                 state = self.state[p]
                 if len(state) == 0:
                     state["step"] = 0
-                    compress_this_m = use_compress_m and p.numel() >= group["min_m_compress_elements"]
+                    compress_this_m = (
+                        use_compress_m and p.numel() >= group["min_m_compress_elements"]
+                    )
                     state["_compress_m"] = compress_this_m
                     if compress_this_m:
                         state["m_mgr"] = CoStateManager(
@@ -254,7 +273,10 @@ class TurboAdam(Optimizer):
                 if use_compress_v and "compressed_v" not in state:
                     v = torch.full_like(p, 1e-30, dtype=torch.float32)
                     state["compressed_v"] = compress_v_logscale(
-                        v, n_bits=v_bits, block_size=block_size, stochastic_round=False,
+                        v,
+                        n_bits=v_bits,
+                        block_size=block_size,
+                        stochastic_round=False,
                     )
                     if _HAS_TRITON and p.is_cuda:
                         num_blocks = state["compressed_v"]["scales"].shape[0]

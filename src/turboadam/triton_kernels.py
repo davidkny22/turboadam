@@ -31,6 +31,7 @@ def _rand_uniform_u32(seed, values):
 #   5. Normalize to [0, n_buckets), stochastic round, store new indices
 #   6. Store new scales (log_min, log_max) and v_new values
 
+
 @triton.jit
 def _fused_v_update_kernel(
     # Inputs
@@ -90,7 +91,9 @@ def _fused_v_update_kernel(
         frac = continuous - floor_idx
         rand_val = tl.load(rand_buf_ptr + offs, mask=mask, other=0.5)
         rounded = floor_idx + (rand_val < frac).to(tl.float32)
-        new_idx = tl.minimum(tl.maximum(rounded, 0.0), (n_buckets - 1) * 1.0).to(tl.uint8)
+        new_idx = tl.minimum(tl.maximum(rounded, 0.0), (n_buckets - 1) * 1.0).to(
+            tl.uint8
+        )
 
         # Store
         tl.store(new_indices_ptr + offs, new_idx)
@@ -124,7 +127,7 @@ def triton_fused_v_update(
     Returns:
         (new_indices, new_scales, v_flat) where v_flat has shape (original_numel,).
     """
-    n_buckets = 2 ** n_bits
+    n_buckets = 2**n_bits
     num_blocks = scales.shape[0]
     padded_numel = num_blocks * block_size
 
@@ -144,8 +147,13 @@ def triton_fused_v_update(
     n_programs = min(num_blocks, max_programs)
 
     _fused_v_update_kernel[(n_programs,)](
-        indices, scales.reshape(-1), grad_flat, rand_buf,
-        new_indices, new_scales.reshape(-1), v_out,
+        indices,
+        scales.reshape(-1),
+        grad_flat,
+        rand_buf,
+        new_indices,
+        new_scales.reshape(-1),
+        v_out,
         beta2=beta2,
         one_minus_beta2=1.0 - beta2,
         n_buckets=n_buckets,
@@ -164,12 +172,20 @@ def triton_fused_v_update(
 # Input:  packed sign bytes, labels, block_norms, scales, alpha, gradient
 # Output: reconstructed m = alpha * g + delta_hat
 
+
 @triton.jit
 def _costate_decode_kernel(
-    sign_packed_ptr, labels_ptr, block_norms_ptr, amp_scales_ptr, g_ptr, alpha_ptr,
+    sign_packed_ptr,
+    labels_ptr,
+    block_norms_ptr,
+    amp_scales_ptr,
+    g_ptr,
+    alpha_ptr,
     m_out_ptr,
-    original_numel, num_blocks,
-    inv_sqrt_bs: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+    original_numel,
+    num_blocks,
+    inv_sqrt_bs: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     n_programs = tl.num_programs(0)
@@ -183,7 +199,9 @@ def _costate_decode_kernel(
         g = tl.load(g_ptr + offs, mask=mask, other=0.0)
         byte_offsets = offs // 8
         bit_positions = 7 - (offs % 8)
-        packed_bytes = tl.load(sign_packed_ptr + byte_offsets, mask=mask, other=0).to(tl.int32)
+        packed_bytes = tl.load(sign_packed_ptr + byte_offsets, mask=mask, other=0).to(
+            tl.int32
+        )
         sign_bits = (packed_bytes >> bit_positions) & 1
         signs = 1.0 - 2.0 * sign_bits.to(tl.float32)
 
@@ -227,7 +245,11 @@ def triton_costate_decode(
     n_programs = min(num_blocks, 1024)
 
     _costate_decode_kernel[(n_programs,)](
-        sign_packed, labels, block_norms, scales, g_flat,
+        sign_packed,
+        labels,
+        block_norms,
+        scales,
+        g_flat,
         alpha_tensor,
         m_out,
         original_numel=original_numel,
@@ -243,12 +265,18 @@ def triton_costate_decode(
 # Fused CoState encode: compute block norms + pack signs + compute scales
 # ---------------------------------------------------------------------------
 
+
 @triton.jit
 def _costate_encode_kernel(
-    delta_ptr, labels_ptr,
-    sign_packed_ptr, block_norms_ptr, amp_scales_ptr,
-    original_numel, num_blocks,
-    inv_sqrt_bs: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+    delta_ptr,
+    labels_ptr,
+    sign_packed_ptr,
+    block_norms_ptr,
+    amp_scales_ptr,
+    original_numel,
+    num_blocks,
+    inv_sqrt_bs: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     n_programs = tl.num_programs(0)
@@ -309,8 +337,11 @@ def triton_costate_encode(
     n_programs = min(num_blocks, 1024)
 
     _costate_encode_kernel[(n_programs,)](
-        delta_padded, labels,
-        sign_packed, block_norms, amp_scales,
+        delta_padded,
+        labels,
+        sign_packed,
+        block_norms,
+        amp_scales,
         original_numel=original_numel,
         num_blocks=num_blocks,
         inv_sqrt_bs=1.0 / math.sqrt(block_size),
@@ -335,11 +366,16 @@ def triton_costate_encode(
 #   2. block_ratios: r_block = norm(delta_block) / norm(m_block)
 #   3. classify: label = 0 if r < tau0, 1 if tau0 <= r < tau1, 2 if r >= tau1
 
+
 @triton.jit
 def _decompose_ratios_kernel(
-    m_ptr, g_ptr, alpha_ptr,
-    delta_ptr, ratios_ptr,
-    original_numel, num_blocks,
+    m_ptr,
+    g_ptr,
+    alpha_ptr,
+    delta_ptr,
+    ratios_ptr,
+    original_numel,
+    num_blocks,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -374,13 +410,18 @@ def triton_decompose_ratios(
     num_blocks = triton.cdiv(original_numel, block_size)
 
     alpha_tensor = alpha.reshape(1).float()
-    delta_padded = torch.empty(num_blocks * block_size, dtype=torch.float32, device=m_new.device)
+    delta_padded = torch.empty(
+        num_blocks * block_size, dtype=torch.float32, device=m_new.device
+    )
     ratios = torch.empty(num_blocks, dtype=torch.float32, device=m_new.device)
     n_programs = min(num_blocks, 1024)
 
     _decompose_ratios_kernel[(n_programs,)](
-        m_flat, g_flat, alpha_tensor,
-        delta_padded, ratios,
+        m_flat,
+        g_flat,
+        alpha_tensor,
+        delta_padded,
+        ratios,
         original_numel=original_numel,
         num_blocks=num_blocks,
         BLOCK_SIZE=block_size,
@@ -391,9 +432,16 @@ def triton_decompose_ratios(
 
 @triton.jit
 def _decompose_ratios_classify_kernel(
-    m_ptr, g_ptr, alpha, tau0, tau1,
-    delta_ptr, ratios_ptr, labels_ptr,
-    original_numel, num_blocks,
+    m_ptr,
+    g_ptr,
+    alpha,
+    tau0,
+    tau1,
+    delta_ptr,
+    ratios_ptr,
+    labels_ptr,
+    original_numel,
+    num_blocks,
     BLOCK_SIZE: tl.constexpr,
 ):
     block_id = tl.program_id(0)
@@ -444,13 +492,21 @@ def triton_decompose_ratios_classify(
     labels = torch.empty(num_blocks, dtype=torch.uint8, device=m_new.device)
 
     # Thresholds are cached Python floats; alpha may be GPU tensor
-    alpha_f = alpha.detach().cpu().item() if isinstance(alpha, torch.Tensor) else float(alpha)
+    alpha_f = (
+        alpha.detach().cpu().item() if isinstance(alpha, torch.Tensor) else float(alpha)
+    )
     tau0_f = float(tau0)
     tau1_f = float(tau1)
 
     _decompose_ratios_classify_kernel[(num_blocks,)](
-        m_padded, g_padded, alpha_f, tau0_f, tau1_f,
-        delta_padded, ratios, labels,
+        m_padded,
+        g_padded,
+        alpha_f,
+        tau0_f,
+        tau1_f,
+        delta_padded,
+        ratios,
+        labels,
         original_numel=original_numel,
         num_blocks=num_blocks,
         BLOCK_SIZE=block_size,

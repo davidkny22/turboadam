@@ -1,7 +1,6 @@
 """Tests for 2-bit log-scale quantization."""
 
 import torch
-import pytest
 from turboadam.quantize import quantize_logscale, dequantize_logscale
 
 

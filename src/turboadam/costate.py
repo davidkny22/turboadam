@@ -36,7 +36,9 @@ def decompose(m: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     g_flat = g.reshape(-1)
     g_dot_g = g_flat.dot(g_flat)
     # Keep alpha as a GPU scalar tensor — no .item() sync
-    alpha = torch.where(g_dot_g > 0, m_flat.dot(g_flat) / g_dot_g, g_dot_g.new_zeros(()))
+    alpha = torch.where(
+        g_dot_g > 0, m_flat.dot(g_flat) / g_dot_g, g_dot_g.new_zeros(())
+    )
     delta = m - alpha * g
     return alpha, delta
 
@@ -44,6 +46,7 @@ def decompose(m: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
 # ---------------------------------------------------------------------------
 # Block ratio computation
 # ---------------------------------------------------------------------------
+
 
 def compute_block_ratios(
     delta: torch.Tensor,
@@ -71,8 +74,8 @@ def compute_block_ratios(
     delta_blocks = delta_padded.reshape(num_blocks, block_size)
     m_blocks = m_padded.reshape(num_blocks, block_size)
 
-    delta_norms = delta_blocks.norm(dim=1)   # (num_blocks,)
-    m_norms = m_blocks.norm(dim=1)           # (num_blocks,)
+    delta_norms = delta_blocks.norm(dim=1)  # (num_blocks,)
+    m_norms = m_blocks.norm(dim=1)  # (num_blocks,)
 
     # Guard: where m_norm is zero, ratio is 0
     safe_m_norms = m_norms.clone()
@@ -86,6 +89,7 @@ def compute_block_ratios(
 # ---------------------------------------------------------------------------
 # Threshold computation
 # ---------------------------------------------------------------------------
+
 
 def compute_thresholds(
     ratios: torch.Tensor,
@@ -118,6 +122,7 @@ def compute_thresholds(
 # Block classification
 # ---------------------------------------------------------------------------
 
+
 def classify_blocks(
     ratios: torch.Tensor,
     tau0: float,
@@ -148,6 +153,7 @@ def classify_blocks(
 # Encoding and decoding
 # ---------------------------------------------------------------------------
 
+
 def _pack_signs(values: torch.Tensor) -> torch.Tensor:
     """Pack sign bits (1 if negative, 0 if non-negative) into uint8, 8 bits/byte.
 
@@ -164,10 +170,14 @@ def _pack_signs(values: torch.Tensor) -> torch.Tensor:
     sign_bits = (values < 0).to(torch.uint8).reshape(-1, 8)
     # Pack via bitwise shifts (avoids creating multiplier tensor each call)
     packed = (
-        (sign_bits[:, 0] << 7) | (sign_bits[:, 1] << 6) |
-        (sign_bits[:, 2] << 5) | (sign_bits[:, 3] << 4) |
-        (sign_bits[:, 4] << 3) | (sign_bits[:, 5] << 2) |
-        (sign_bits[:, 6] << 1) | sign_bits[:, 7]
+        (sign_bits[:, 0] << 7)
+        | (sign_bits[:, 1] << 6)
+        | (sign_bits[:, 2] << 5)
+        | (sign_bits[:, 3] << 4)
+        | (sign_bits[:, 4] << 3)
+        | (sign_bits[:, 5] << 2)
+        | (sign_bits[:, 6] << 1)
+        | sign_bits[:, 7]
     )
     return packed
 
@@ -190,7 +200,9 @@ def _unpack_signs(packed: torch.Tensor, n: int) -> torch.Tensor:
     work_device = torch.device("cpu") if is_mps else orig_device
 
     packed_int = packed.to(dtype=torch.int32, device=work_device)
-    shifts = torch.tensor([7, 6, 5, 4, 3, 2, 1, 0], dtype=torch.int32, device=work_device)
+    shifts = torch.tensor(
+        [7, 6, 5, 4, 3, 2, 1, 0], dtype=torch.int32, device=work_device
+    )
     # (num_bytes, 8): extract all 8 bits per byte in one shot
     bits = ((packed_int.unsqueeze(1) >> shifts.unsqueeze(0)) & 1).float()
     bits = bits.reshape(-1)[:n]
@@ -220,7 +232,6 @@ def encode_blocks(
                                    that sign-only reconstruction (amplitude costate) uses.
     """
     delta_flat = delta.reshape(-1).float()
-    original_numel = delta_flat.shape[0]
 
     delta_padded, _ = pad_to_blocks(delta_flat, block_size)
     num_blocks = delta_padded.shape[0] // block_size
@@ -292,7 +303,7 @@ def decode_blocks(
     #   Phase (1):     scale = block_norm / sqrt(block_size)
     #   Amplitude (2): scale = fp16 stored scale
     # Build a (num_blocks,) scale tensor, then broadcast over block_size.
-    phase_scales = block_norms / math.sqrt(block_size)           # (num_blocks,)
+    phase_scales = block_norms / math.sqrt(block_size)  # (num_blocks,)
 
     # Build per-block scale: null→0, phase→phase_scale, amplitude→stored scale
     # Use label as index: [0_scale, phase_scale, amp_scale] per block
@@ -303,7 +314,9 @@ def decode_blocks(
     block_scales[mask_amp] = scales[mask_amp]
 
     # Broadcast: (num_blocks, 1) * (num_blocks, block_size) → (num_blocks, block_size)
-    delta_hat_blocks = block_scales.unsqueeze(1) * signs_blocks  # (num_blocks, block_size)
+    delta_hat_blocks = (
+        block_scales.unsqueeze(1) * signs_blocks
+    )  # (num_blocks, block_size)
 
     # Trim to original numel and reconstruct m
     delta_hat = delta_hat_blocks.reshape(-1)[:original_numel]
@@ -314,6 +327,7 @@ def decode_blocks(
 # ---------------------------------------------------------------------------
 # CoStateManager — stateful per-step update loop (spec section 4.5)
 # ---------------------------------------------------------------------------
+
 
 class CoStateManager:
     """Stateful manager for CoState first moment compression.
@@ -367,9 +381,11 @@ class CoStateManager:
         # Use Triton kernels if available and on CUDA
         try:
             from turboadam.triton_kernels import (
-                triton_costate_decode, triton_costate_encode,
+                triton_costate_decode,
+                triton_costate_encode,
                 triton_decompose_ratios,
             )
+
             _use_triton = g.is_cuda
         except ImportError:
             _use_triton = False
@@ -411,7 +427,9 @@ class CoStateManager:
         # Error feedback: measure what the encoding lost, accumulate for next step
         if self._error_feedback:
             zero_alpha = g.new_zeros(1)
-            delta_hat = _decode(encoded_new, zero_alpha, g, self.block_size, m_new.numel())
+            delta_hat = _decode(
+                encoded_new, zero_alpha, g, self.block_size, m_new.numel()
+            )
             ef_error = (delta_new - delta_hat).detach()
             if self._ef_residual is None:
                 self._ef_residual = ef_error
@@ -422,7 +440,9 @@ class CoStateManager:
         # on subsequent calls copy data in-place to keep tensor addresses stable.
         if self._encoded is None:
             # First step: allocate graph-stable buffers by cloning
-            self._alpha = alpha_new.clone() if isinstance(alpha_new, torch.Tensor) else alpha_new
+            self._alpha = (
+                alpha_new.clone() if isinstance(alpha_new, torch.Tensor) else alpha_new
+            )
             self._encoded = {
                 "labels": encoded_new["labels"].clone(),
                 "sign_packed": encoded_new["sign_packed"].clone(),

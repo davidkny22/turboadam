@@ -33,7 +33,10 @@ def compress_v_logscale(
     pad_value = max(v_min, 1e-38)
     v_padded, original_length = pad_to_blocks(v_flat, block_size, pad_value=pad_value)
     indices, scales, nb = quantize_logscale_nbits(
-        v_padded, n_bits=n_bits, block_size=block_size, stochastic_round=stochastic_round,
+        v_padded,
+        n_bits=n_bits,
+        block_size=block_size,
+        stochastic_round=stochastic_round,
     )
     return {
         "indices": indices,

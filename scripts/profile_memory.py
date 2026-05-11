@@ -20,9 +20,15 @@ from turboadam import TurboAdam
 def _make_params(device: str = "cuda"):
     """Return a list of Parameters mimicking one GPT-2 layer."""
     shapes = [
-        (768, 768), (768, 768), (768, 768), (768, 768),
-        (768, 3072), (3072, 768),
-        (768,), (768,), (768,),
+        (768, 768),
+        (768, 768),
+        (768, 768),
+        (768, 768),
+        (768, 3072),
+        (3072, 768),
+        (768,),
+        (768,),
+        (768,),
     ]
     params = []
     for s in shapes:
@@ -54,7 +60,7 @@ def _measure_memory(opt_class, opt_kwargs, params):
                 for vv in v.values():
                     if isinstance(vv, torch.Tensor):
                         persistent += vv.numel() * vv.element_size()
-            elif hasattr(v, '_encoded') and v._encoded is not None:
+            elif hasattr(v, "_encoded") and v._encoded is not None:
                 for vv in v._encoded.values():
                     if isinstance(vv, torch.Tensor):
                         persistent += vv.numel() * vv.element_size()
@@ -72,7 +78,11 @@ def main():
         ("TurboAdam (m+v)", TurboAdam, {}),
         ("TurboAdam (v only)", TurboAdam, {"compress_m": False}),
         ("TurboAdam (m only)", TurboAdam, {"compress_v": False}),
-        ("TurboAdam (no compression)", TurboAdam, {"compress_m": False, "compress_v": False}),
+        (
+            "TurboAdam (no compression)",
+            TurboAdam,
+            {"compress_m": False, "compress_v": False},
+        ),
     ]
 
     print("=" * 60)
@@ -93,12 +103,14 @@ def main():
             ratio = persistent / baseline_persistent
 
         print(f"{name:30s} persistent={persistent:8,} B  ({ratio:.2f}x vs baseline)")
-        results.append({
-            "config": name,
-            "peak_delta_bytes": peak_delta,
-            "persistent_bytes": persistent,
-            "ratio_vs_baseline": ratio,
-        })
+        results.append(
+            {
+                "config": name,
+                "peak_delta_bytes": peak_delta,
+                "persistent_bytes": persistent,
+                "ratio_vs_baseline": ratio,
+            }
+        )
 
     print("=" * 60)
 

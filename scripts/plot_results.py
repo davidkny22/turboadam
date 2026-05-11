@@ -13,6 +13,7 @@ import json
 import os
 
 import matplotlib
+
 matplotlib.use("Agg")  # non-interactive backend
 import matplotlib.pyplot as plt
 
@@ -20,6 +21,7 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Plot TurboAdam vs baseline loss curves")
@@ -48,6 +50,7 @@ def parse_args():
 # Log loading
 # ---------------------------------------------------------------------------
 
+
 def load_jsonl(path: str) -> list[dict]:
     """Load a JSONL file and return a list of dicts."""
     entries = []
@@ -62,6 +65,7 @@ def load_jsonl(path: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
+
 
 def plot_loss_overlay(
     baseline_entries: list[dict],
@@ -83,8 +87,20 @@ def plot_loss_overlay(
 
     fig, ax = plt.subplots(figsize=(10, 5))
 
-    ax.plot(baseline_steps, baseline_loss, label="AdamW (baseline)", color="steelblue", linewidth=1.5)
-    ax.plot(turboadam_steps, turboadam_loss, label="TurboAdam", color="darkorange", linewidth=1.5)
+    ax.plot(
+        baseline_steps,
+        baseline_loss,
+        label="AdamW (baseline)",
+        color="steelblue",
+        linewidth=1.5,
+    )
+    ax.plot(
+        turboadam_steps,
+        turboadam_loss,
+        label="TurboAdam",
+        color="darkorange",
+        linewidth=1.5,
+    )
 
     ax.set_xlabel("Step")
     ax.set_ylabel("Loss (cross-entropy)")
@@ -101,6 +117,7 @@ def plot_loss_overlay(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main():
     args = parse_args()
