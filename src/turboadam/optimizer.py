@@ -112,7 +112,7 @@ class TurboAdam(Optimizer):
                     state["exp_avg"].mul_(beta1).add_(grad, alpha=1.0 - beta1)
                     m_new = state["exp_avg"]
 
-                # Bias corrections are tensors so CUDA graph replay sees new values.
+                # Bias corrections stored as tensors for state_dict compatibility.
                 bias_correction1 = state["_bc1"]
                 bias_correction2 = state["_bc2"]
 

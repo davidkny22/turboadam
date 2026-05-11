@@ -16,7 +16,7 @@ No warmup required — EMA error-washing handles cold-start.
 import math
 import torch
 
-from turboadam.utils import pad_to_blocks, unpad_from_blocks, BLOCK_SIZE
+from turboadam.utils import pad_to_blocks, BLOCK_SIZE
 
 
 def decompose(m: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -336,7 +336,6 @@ class CoStateManager:
     def __init__(
         self,
         block_size: int = BLOCK_SIZE,
-        threshold_interval: int = 10,
         error_feedback: bool = False,
         null_pct: float = 0.10,
         amp_pct: float = 0.90,
@@ -348,9 +347,6 @@ class CoStateManager:
         self._alpha = 0.0  # becomes a scalar tensor after first update
         self._encoded: dict | None = None
         self._original_numel: int = 0
-        self._threshold_interval = threshold_interval
-        self._cached_tau: tuple | None = None
-        self._step_count: int = 0
         self._error_feedback = error_feedback
         self._ef_residual: torch.Tensor | None = None
 
@@ -422,9 +418,8 @@ class CoStateManager:
             else:
                 self._ef_residual = beta1 * self._ef_residual + (1.0 - beta1) * ef_error
 
-        # For CUDA graph compatibility, write into pre-allocated buffers
-        # so tensor addresses stay stable across graph replays.
-        # On first call: allocate and assign. On subsequent calls: copy data in-place.
+        # Graph-stable buffer management: on first call allocate by cloning,
+        # on subsequent calls copy data in-place to keep tensor addresses stable.
         if self._encoded is None:
             # First step: allocate graph-stable buffers by cloning
             self._alpha = alpha_new.clone() if isinstance(alpha_new, torch.Tensor) else alpha_new

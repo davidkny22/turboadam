@@ -18,7 +18,6 @@ import torch
 
 BLOCK_SIZE = 128
 MATRIX_NUMEL_THRESHOLD = 10_000
-SVD_RANK_DEFAULT = 8
 
 
 def is_matrix_param(param: torch.Tensor) -> bool:

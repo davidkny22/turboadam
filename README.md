@@ -1,6 +1,6 @@
 # TurboAdam
 
-[![Tests](https://img.shields.io/badge/tests-167%2F167-brightgreen)]() [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]() [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange)]() [![License](https://img.shields.io/badge/license-MIT-green)]()
+[![Tests](https://img.shields.io/badge/tests-148%2F148-brightgreen)]() [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]() [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange)]() [![License](https://img.shields.io/badge/license-MIT-green)]()
 
 **Drop-in Adam/AdamW replacement with 6.5× optimizer-state memory reduction.**
 

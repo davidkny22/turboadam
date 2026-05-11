@@ -679,3 +679,36 @@ class TestAddParamGroup:
         # x with lr=1e-2 should change less than y with lr=1e-1
         assert x.data.mean() != 1.0
         assert y.data.mean() != 1.0
+
+
+# ---------------------------------------------------------------------------
+# 14. Constructor validation
+# ---------------------------------------------------------------------------
+
+class TestConstructorValidation:
+    def test_capturable_true_raises(self):
+        """capturable=True should raise NotImplementedError."""
+        with pytest.raises(NotImplementedError, match="CUDA graph capture"):
+            TurboAdam([nn.Parameter(torch.randn(10))], capturable=True)
+
+    def test_min_m_compress_elements_respected(self):
+        """Params below min_m_compress_elements should skip CoState."""
+        torch.manual_seed(0)
+        x = nn.Parameter(torch.randn(100))  # 100 elements
+        opt = TurboAdam([x], min_m_compress_elements=200)
+        opt.zero_grad()
+        (x ** 2).sum().backward()
+        opt.step()
+        assert "exp_avg" in opt.state[x]  # fp32 m, not CoState
+        assert "m_mgr" not in opt.state[x]
+
+    def test_min_m_compress_elements_large_param_uses_costate(self):
+        """Params above min_m_compress_elements should use CoState."""
+        torch.manual_seed(0)
+        x = nn.Parameter(torch.randn(5000))  # 5000 elements
+        opt = TurboAdam([x], min_m_compress_elements=100)
+        opt.zero_grad()
+        (x ** 2).sum().backward()
+        opt.step()
+        assert "m_mgr" in opt.state[x]  # CoState manager
+        assert "exp_avg" not in opt.state[x]
