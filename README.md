@@ -1,6 +1,6 @@
 # TurboAdam
 
-[![Tests](https://img.shields.io/badge/tests-148%2F148-brightgreen)]() [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]() [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-orange)]() [![License](https://img.shields.io/badge/license-MIT-green)]()
+[![Tests](https://img.shields.io/badge/tests-151%2F151-brightgreen)]() [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]() [![PyTorch](https://img.shields.io/badge/PyTorch-2.2%2B-orange)]() [![License](https://img.shields.io/badge/license-MIT-green)]()
 
 **Drop-in Adam/AdamW replacement with 6.5× optimizer-state memory reduction.**
 
@@ -33,10 +33,16 @@ TurboAdam compresses both moments in-place during training, cutting optimizer-st
 ### Install
 
 ```bash
-pip install git+https://github.com/davidkogan/turboadam.git
+pip install turboadam
 ```
 
-Requirements: Python ≥3.10, PyTorch ≥2.0, Triton (optional, for CUDA speed-ups).
+For the latest source version:
+
+```bash
+pip install git+https://github.com/davidkny22/turboadam.git
+```
+
+Requirements: Python >=3.10, PyTorch >=2.2, Triton (optional, for CUDA speed-ups).
 
 ### Use
 
@@ -165,7 +171,7 @@ All arguments are standard PyTorch Optimizer kwargs plus TurboAdam-specific comp
 ## Validation
 
 ```bash
-# Full test suite (148 tests)
+# Full test suite (151 tests)
 python -m pytest tests/ -q
 
 # Quick convergence smoke test

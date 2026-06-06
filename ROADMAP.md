@@ -17,6 +17,7 @@
 - **FSDP compatibility:** Flatten CoStateManager state into plain tensors for `torch.distributed.fsdp.FullyShardedDataParallel`
 - **DeepSpeed ZeRO compatibility:** Ensure optimizer state shards correctly across ranks
 - DDP validation and performance testing
+- Add release CI workflow for tag-triggered build and publish via PyPI trusted publishing or token secret
 
 ### v0.3.0 — Scale Validation
 - **7B model benchmark:** Validate convergence gap at 7B scale (Llama-2-7B or equivalent)

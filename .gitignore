@@ -30,3 +30,6 @@ docs/superpowers/
 # Local CUDA/Triton verification caches
 .tmp/
 .triton_cache/
+
+# Release process workspace
+release-work/

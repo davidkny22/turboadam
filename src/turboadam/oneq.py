@@ -16,16 +16,26 @@ def compress_v_logscale(
     block_size: int = BLOCK_SIZE,
     stochastic_round: bool = False,
 ) -> dict:
-    """Compress v via n-bit log-scale quantization.
+    """Compress a second-moment tensor with n-bit log-scale quantization.
 
-    Args:
-        v:               Second-moment tensor (any shape, fp32, positive).
-        n_bits:          Bits per element (default 3 = 8 buckets).
-        block_size:      Quantization block size.
-        stochastic_round: Use stochastic rounding (essential for compress-every-step).
+    Parameters
+    ----------
+    v:
+        Second-moment tensor of any shape. Values are converted to fp32 and
+        padded to complete quantization blocks before encoding.
+    n_bits:
+        Number of bits per element, which determines the number of log-scale
+        buckets in each block.
+    block_size:
+        Number of elements per independent quantization block.
+    stochastic_round:
+        Whether to use stochastic rounding when assigning bucket indices.
 
-    Returns:
-        Compressed dict with 'indices', 'scales', metadata.
+    Returns
+    -------
+    dict
+        Compressed representation containing quantized indices, per-block
+        scales, bit width, original shape, original length, and block size.
     """
     original_shape = v.shape
     v_flat = v.reshape(-1).float()
