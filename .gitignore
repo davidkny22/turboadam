@@ -32,4 +32,5 @@ docs/superpowers/
 .triton_cache/
 
 # Release process workspace
+release-task.md
 release-work/
