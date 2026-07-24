@@ -1,4 +1,4 @@
-"""Triton kernels for TurboAdam — fused operations to minimize kernel launch overhead."""
+"""Triton kernels for TurboAdam: fused operations to minimize kernel launch overhead."""
 
 import math
 
@@ -9,7 +9,9 @@ import triton.language as tl
 
 @triton.jit
 def _rand_uniform_u32(seed, values):
-    x = values.to(tl.uint32) ^ seed
+    # Hash element key + per-step seed to uniform [0,1). Avoids a persistent
+    # fp32 random buffer (32 bits/param on the CUDA path).
+    x = values.to(tl.uint32) ^ seed.to(tl.uint32)
     x = (x ^ (x >> 16)) * 0x7FEB352D
     x = (x ^ (x >> 15)) * 0x846CA68B
     x = x ^ (x >> 16)
@@ -38,12 +40,12 @@ def _fused_v_update_kernel(
     old_indices_ptr,
     old_scales_ptr,
     grad_ptr,
-    rand_buf_ptr,
     # Outputs
     new_indices_ptr,
     new_scales_ptr,
     v_out_ptr,
     # Params
+    seed,
     beta2: tl.constexpr,
     one_minus_beta2: tl.constexpr,
     n_buckets: tl.constexpr,
@@ -75,7 +77,7 @@ def _fused_v_update_kernel(
         # EMA
         v_new = beta2 * v_old + one_minus_beta2 * g_sq
 
-        # Recompress — mask padded elements out of block min/max so partial
+        # Recompress: mask padded elements out of block min/max so partial
         # blocks don't have their statistics corrupted by padding values.
         log_v_new = tl.log(tl.maximum(v_new, 1e-38))
         log_v_for_min = tl.where(mask, log_v_new, 1e38)
@@ -84,16 +86,18 @@ def _fused_v_update_kernel(
         new_log_max = tl.max(log_v_for_max, axis=0)
         new_span = tl.maximum(new_log_max - new_log_min, 1e-10)
         normalized = (log_v_new - new_log_min) / new_span
-        continuous = normalized * n_buckets
 
-        # Stochastic rounding — load from pre-generated random buffer
+        # Stochastic rounding between bucket CENTERS. Decode uses
+        # (idx+0.5)/n_buckets, so rounding (normalized*n_buckets - 0.5) gives
+        # E[decoded] = normalized with no half-bin upward drift.
+        continuous = normalized * n_buckets - 0.5
         floor_idx = tl.math.floor(continuous)
         frac = continuous - floor_idx
-        rand_val = tl.load(rand_buf_ptr + offs, mask=mask, other=0.5)
+        rand_val = _rand_uniform_u32(seed, offs)
         rounded = floor_idx + (rand_val < frac).to(tl.float32)
-        new_idx = tl.minimum(tl.maximum(rounded, 0.0), (n_buckets - 1) * 1.0).to(
-            tl.uint8
-        )
+        new_idx = tl.minimum(
+            tl.maximum(rounded, 0.0), (n_buckets - 1) * 1.0
+        ).to(tl.uint8)
 
         # Store
         tl.store(new_indices_ptr + offs, new_idx)
@@ -110,7 +114,7 @@ def triton_fused_v_update(
     n_bits: int,
     block_size: int,
     original_numel: int,
-    rand_buf: torch.Tensor | None = None,
+    seed: int = 0,
     out_indices: torch.Tensor | None = None,
     out_scales: torch.Tensor | None = None,
     v_out: torch.Tensor | None = None,
@@ -119,10 +123,10 @@ def triton_fused_v_update(
 
     Drop-in replacement for quantize.fused_v_update.
 
-    Args:
-        rand_buf: Pre-generated random buffer (same size as indices).
-            Filled with torch.rand() before each call. CUDA graph safe
-            because the buffer address is stable, only contents change.
+    Stochastic-rounding randomness is hashed in-kernel from ``seed`` and the
+    element offset, so no persistent fp32 random buffer is allocated.  The
+    caller should pass a fresh seed on every step (and a distinct seed per
+    parameter in a step) so the rounding noise is independent across steps.
 
     Returns:
         (new_indices, new_scales, v_flat) where v_flat has shape (original_numel,).
@@ -136,8 +140,6 @@ def triton_fused_v_update(
     new_scales = torch.empty_like(scales) if out_scales is None else out_scales
     if v_out is None:
         v_out = torch.empty(padded_numel, dtype=torch.float32, device=grad.device)
-    if rand_buf is None:
-        rand_buf = torch.rand(padded_numel, dtype=torch.float32, device=grad.device)
 
     # Flatten gradient for kernel access (cast to fp32 for numerical stability)
     grad_flat = grad.reshape(-1).float().contiguous()
@@ -150,10 +152,10 @@ def triton_fused_v_update(
         indices,
         scales.reshape(-1),
         grad_flat,
-        rand_buf,
         new_indices,
         new_scales.reshape(-1),
         v_out,
+        seed,
         beta2=beta2,
         one_minus_beta2=1.0 - beta2,
         n_buckets=n_buckets,
@@ -281,7 +283,7 @@ def _costate_encode_kernel(
     pid = tl.program_id(0)
     n_programs = tl.num_programs(0)
 
-    # Load from padded tensor — all elements valid (including padding)
+    # Load from padded tensor: all elements valid (including padding)
     for block_id in range(pid, num_blocks, n_programs):
         block_start = block_id * BLOCK_SIZE
         offs = block_start + tl.arange(0, BLOCK_SIZE)

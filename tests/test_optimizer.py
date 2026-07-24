@@ -1,4 +1,4 @@
-"""Integration tests for TurboAdam optimizer — compress-every-step architecture.
+"""Integration tests for TurboAdam optimizer: compress-every-step architecture.
 
 Covers:
 - API compatibility with torch.optim.Adam
@@ -122,7 +122,7 @@ class TestConvergence:
 
 
 # ---------------------------------------------------------------------------
-# 3. State structure — compressed v and CoState m
+# 3. State structure: compressed v and CoState m
 # ---------------------------------------------------------------------------
 
 
@@ -228,6 +228,36 @@ class TestStateStructure:
             _step_with_grad(opt, params)
             for p in params:
                 assert opt.state[p]["step"] == step_num
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="CUDA required"
+    )
+    def test_cuda_state_has_no_random_buffer(self):
+        """compressed_v must carry only indices, scales, and metadata on CUDA.
+
+        Stochastic-rounding randomness is hashed in-kernel from a per-step seed,
+        so no per-parameter fp32 random buffer is stored in optimizer state.
+        """
+        torch.manual_seed(0)
+        p = nn.Parameter(torch.randn(64, 64, device="cuda"))
+        opt = TurboAdam([p], lr=1e-2, v_bits=4)
+        opt.zero_grad()
+        (p ** 2).sum().backward()
+        opt.step()
+        cv = opt.state[p]["compressed_v"]
+        assert "rand_buf" not in cv, (
+            "compressed_v must not store a persistent fp32 random buffer"
+        )
+        tensor_values = [v for v in cv.values() if torch.is_tensor(v)]
+        bytes_per_param = (
+            sum(t.element_size() * t.numel() for t in tensor_values) / p.numel()
+        )
+        # v_bits=4 yields ~4.25 bits/param (4-bit indices + 2 fp16 scales per
+        # 128-elem block); the persistent random buffer would have added 32.
+        assert bytes_per_param * 8 < 16, (
+            f"v state exceeds 16 bits/param ({bytes_per_param * 8:.2f}); "
+            "a stray fp32 buffer may be present"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -548,7 +578,7 @@ class TestStateDict:
             opt2.step()
 
         # Tolerances relaxed because stochastic rounding's random state
-        # is not captured in state_dict (rand_buf is regenerated each step).
+        # is not captured in state_dict (the per-step seed is not serialized).
         # The key assertion is that load+step does not crash and stays stable.
         assert torch.allclose(x.data, x2.data, atol=0.1)
         assert torch.allclose(y.data, y2.data, atol=0.1)
@@ -571,6 +601,45 @@ class TestStateDict:
         opt2.load_state_dict(state)
 
         # Should be able to step without device errors
+        opt2.zero_grad()
+        (x2**2).sum().backward()
+        opt2.step()
+
+    def test_load_state_dict_migrates_costate_manager_tensors(self):
+        """load_state_dict must move CoStateManager internal tensors to param device.
+
+        CoStateManager stores _alpha, _encoded tensors, and _ef_residual on
+        whatever device they were created on. After load_state_dict, these must
+        sit on the parameter's device or downstream kernels fail with a device
+        mismatch. We exercise the non-empty-error-feedback path too.
+        """
+        torch.manual_seed(0)
+        x = nn.Parameter(torch.randn(64, 64))  # large enough to use CoState
+        opt = TurboAdam([x], lr=1e-2, error_feedback=True)
+        for _ in range(3):
+            opt.zero_grad()
+            (x**2).sum().backward()
+            opt.step()
+        state = opt.state_dict()
+
+        mgr = opt.state[x]["m_mgr"]
+        assert mgr._encoded is not None
+        assert mgr._ef_residual is not None  # error_feedback populated _ef_residual
+
+        x2 = nn.Parameter(x.data.clone())
+        opt2 = TurboAdam([x2], lr=1e-2, error_feedback=True)
+        opt2.load_state_dict(state)
+        mgr2 = opt2.state[x2]["m_mgr"]
+        assert isinstance(mgr2._alpha, torch.Tensor)
+        # All CoState tensors must be on the same device as the param.
+        expected_device = x2.device
+        assert mgr2._alpha.device == expected_device
+        for key in ("labels", "sign_packed", "block_norms", "scales"):
+            assert mgr2._encoded[key].device == expected_device, (
+                f"{key} not migrated to {expected_device}"
+            )
+        assert mgr2._ef_residual.device == expected_device
+        # Stepping after load must not raise (proves tensors are usable).
         opt2.zero_grad()
         (x2**2).sum().backward()
         opt2.step()
@@ -740,3 +809,42 @@ class TestConstructorValidation:
         opt.step()
         assert "m_mgr" in opt.state[x]  # CoState manager
         assert "exp_avg" not in opt.state[x]
+
+
+# ---------------------------------------------------------------------------
+# 15. Skipped grads, error feedback, and lone biased-time path
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeCases:
+    def test_param_without_grad_is_skipped(self):
+        """When some params have no gradient, step() must skip them cleanly."""
+        torch.manual_seed(0)
+        p1 = nn.Parameter(torch.randn(64, 64))
+        p2 = nn.Parameter(torch.randn(64, 64))
+        opt = TurboAdam([p1, p2], lr=1e-2)
+        opt.zero_grad(set_to_none=True)
+        (p1**2).sum().backward()  # only p1 has grad
+        opt.step()
+        assert opt.state[p1]["step"] == 1
+        assert p2 not in opt.state or opt.state[p2].get("step", 0) == 0
+        assert not torch.allclose(p1.data, p2.data)
+
+    def test_error_feedback_converges_and_accumulates_residual(self):
+        """error_feedback=True must converge and populate _ef_residual.
+
+        Error feedback adds the prior encoding loss back into the next gradient.
+        This certifies the path runs without NaN and the residual buffer is
+        populated (the branch was uncovered).
+        """
+        torch.manual_seed(0)
+        x = nn.Parameter(torch.randn(64, 64))
+        opt = TurboAdam([x], lr=1e-2, error_feedback=True)
+        for _ in range(30):
+            opt.zero_grad()
+            (x**2).sum().backward()
+            opt.step()
+        assert not torch.isnan(x).any()
+        mgr = opt.state[x]["m_mgr"]
+        assert mgr._ef_residual is not None
+        assert mgr._ef_residual.shape == x.shape

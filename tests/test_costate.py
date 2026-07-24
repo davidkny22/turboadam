@@ -613,7 +613,7 @@ class TestCoStateManager:
 
         # Run 100 steps with slowly shifting gradients.
         # Gradient direction rotates 0.002 rad/step (≈ 0.115 degrees/step,
-        # ≈ 11.5 degrees total — realistic for convergent training).
+        # ≈ 11.5 degrees total: realistic for convergent training).
         # Norm ≈ sqrt(n/2) ≈ 16 (realistic gradient magnitude, not unit norm).
         # Track true EMA momentum alongside CoStateManager.
         m_true = torch.zeros(n)

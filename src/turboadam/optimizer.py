@@ -1,4 +1,4 @@
-"""TurboAdam optimizer — drop-in replacement for Adam with compressed optimizer states."""
+"""TurboAdam optimizer: drop-in replacement for Adam with compressed optimizer states."""
 
 import torch
 from torch.optim import Optimizer
@@ -80,13 +80,16 @@ class TurboAdam(Optimizer):
         )
         super().__init__(params, defaults)
         self._group_step_tensors = {}
+        # Per-step seed for Triton in-kernel stochastic rounding, mixed with
+        # id(p) so same-shaped params get independent noise in one step.
+        self._triton_seed = 0x12345678
 
     # ------------------------------------------------------------------
     # Core step logic
     # ------------------------------------------------------------------
 
     def _full_step_kernel(self):
-        """Complete optimizer step — m update + v update + weight update."""
+        """Complete optimizer step: m update + v update + weight update."""
         for group in self.param_groups:
             lr = group["lr"]
             beta1, beta2 = group["betas"]
@@ -126,9 +129,9 @@ class TurboAdam(Optimizer):
                         else fused_v_update
                     )
                     if _HAS_TRITON and grad.is_cuda:
-                        # Refill random buffer for stochastic rounding (graph-safe:
-                        # same tensor address, only contents change)
-                        cv["rand_buf"].uniform_()
+                        # Fresh per-step, per-param seed drives in-kernel
+                        # stochastic rounding (no persistent fp32 rand buffer).
+                        seed = (self._triton_seed ^ (id(p) & 0x7FFFFFFF)) & 0x7FFFFFFF
                         # Allocate separate output buffers to avoid aliasing
                         # (Triton assumes no aliasing between pointer args)
                         _new_indices = torch.empty_like(cv["indices"])
@@ -141,7 +144,7 @@ class TurboAdam(Optimizer):
                             cv["n_bits"],
                             cv["block_size"],
                             cv["original_length"],
-                            rand_buf=cv["rand_buf"],
+                            seed=seed,
                             out_indices=_new_indices,
                             out_scales=_new_scales,
                         )
@@ -278,15 +281,12 @@ class TurboAdam(Optimizer):
                         block_size=block_size,
                         stochastic_round=False,
                     )
-                    if _HAS_TRITON and p.is_cuda:
-                        num_blocks = state["compressed_v"]["scales"].shape[0]
-                        padded_numel = num_blocks * block_size
-                        state["compressed_v"]["rand_buf"] = torch.empty(
-                            padded_numel, dtype=torch.float32, device=p.device
-                        )
 
         # Prepare bias corrections for this step
         self._prepare_step_scalars()
         self._full_step_kernel()
+        # Advance the stochastic-rounding seed so the next step draws
+        # independent rounding noise on the Triton path.
+        self._triton_seed = (self._triton_seed * 1664525 + 1013904223) & 0x7FFFFFFF
 
         return loss

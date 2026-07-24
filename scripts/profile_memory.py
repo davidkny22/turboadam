@@ -70,7 +70,7 @@ def _measure_memory(opt_class, opt_kwargs, params):
 
 def main():
     if not torch.cuda.is_available():
-        print("CUDA not available — memory profiling requires GPU.")
+        print("CUDA not available: memory profiling requires GPU.")
         return
 
     configs = [

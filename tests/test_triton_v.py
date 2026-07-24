@@ -38,7 +38,7 @@ class TestTritonVUpdate:
             comp["original_length"],
         )
 
-        # Triton — note: stochastic rounding uses different RNG, so indices won't match
+        # Triton: note: stochastic rounding uses different RNG, so indices won't match
         # But v_out should match (it's computed before quantization)
         tr_idx, tr_scales, tr_v = triton_fused_v_update(
             comp["indices"].clone(),
@@ -192,6 +192,60 @@ class TestTritonVUpdate:
         )
         # Triton should be at least somewhat faster
         assert tr_time < pt_time * 1.5, "Triton should not be significantly slower"
+
+    def test_seed_drives_stochastic_rounding(self):
+        """Stochastic rounding is hashed in-kernel from a seed (no random buffer).
+
+        Same seed with identical inputs reproduces indices exactly; a different
+        seed produces different indices.  The wrapper accepts a Python int seed,
+        not a preallocated fp32 buffer, so no per-parameter fp32 buffer is stored
+        in optimizer state.
+        """
+        from turboadam.triton_kernels import triton_fused_v_update
+
+        comp, grad = _make_test_data()
+        new_idx, new_scales, v_flat = triton_fused_v_update(
+            comp["indices"],
+            comp["scales"],
+            grad,
+            0.999,
+            comp["n_bits"],
+            comp["block_size"],
+            comp["original_length"],
+            seed=12345,
+        )
+        # All outputs are real tensors; no extra buffers leaked out.
+        assert isinstance(new_idx, torch.Tensor)
+        assert isinstance(new_scales, torch.Tensor)
+        assert isinstance(v_flat, torch.Tensor)
+
+        new_idx2, _, _ = triton_fused_v_update(
+            comp["indices"].clone(),
+            comp["scales"].clone(),
+            grad.clone(),
+            0.999,
+            comp["n_bits"],
+            comp["block_size"],
+            comp["original_length"],
+            seed=12345,
+        )
+        assert torch.equal(new_idx, new_idx2), (
+            "Same seed with same inputs must reproduce indices"
+        )
+
+        new_idx3, _, _ = triton_fused_v_update(
+            comp["indices"].clone(),
+            comp["scales"].clone(),
+            grad.clone(),
+            0.999,
+            comp["n_bits"],
+            comp["block_size"],
+            comp["original_length"],
+            seed=99999,
+        )
+        assert not torch.equal(new_idx, new_idx3), (
+            "Different seeds must produce different stochastic rounds"
+        )
 
 
 if __name__ == "__main__":

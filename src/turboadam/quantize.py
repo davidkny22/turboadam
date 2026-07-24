@@ -163,18 +163,23 @@ def quantize_logscale_nbits(
 
     span = (log_max - log_min).unsqueeze(1).clamp(min=1e-10)
     normalized = (log_blocks - log_min.unsqueeze(1)) / span
-    continuous = normalized * n_buckets  # (num_blocks, block_size)
 
     if stochastic_round:
+        # Round between bucket CENTERS. Decode uses (idx+0.5)/n_buckets, so
+        # rounding (normalized*n_buckets - 0.5) gives E[decoded] = normalized
+        # with no half-bin upward drift.
+        continuous = (normalized * n_buckets) - 0.5
         floor_idx = continuous.floor()
         frac = continuous - floor_idx
-        # Round up with probability equal to fractional part (unbiased)
         indices = (
             (floor_idx + (torch.rand_like(frac) < frac).float())
             .clamp(0, n_buckets - 1)
             .to(torch.uint8)
         )
     else:
+        # Deterministic nearest-center: floor(normalized*n_buckets) is the
+        # bucket whose center (idx+0.5)/n_buckets is closest to normalized.
+        continuous = normalized * n_buckets
         indices = continuous.clamp(0, n_buckets - 0.001).to(torch.uint8)
 
     return indices.reshape(-1), scales, n_bits
@@ -228,7 +233,7 @@ def fused_v_update(
     block_size: int,
     original_numel: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Decompress v, apply EMA update, recompress — all in one pass.
+    """Decompress v, apply EMA update, recompress in one pass.
 
     Avoids the pad→unpad→reshape→pad cycle of separate decompress + compress.
 
@@ -282,9 +287,10 @@ def fused_v_update(
 
     new_span = (new_log_max - new_log_min).unsqueeze(1).clamp(min=1e-10)
     normalized = (log_blocks - new_log_min.unsqueeze(1)) / new_span
-    continuous = normalized * n_buckets
 
-    # Stochastic rounding
+    # Stochastic rounding between bucket CENTERS (see quantize_logscale_nbits).
+    # Rounding (normalized*n_buckets - 0.5) avoids half-bin EMA drift.
+    continuous = (normalized * n_buckets) - 0.5
     floor_idx = continuous.floor()
     frac = continuous - floor_idx
     new_indices = (

@@ -1,4 +1,4 @@
-"""TurboAdam training script — mirrors baseline.py with optimizer swapped.
+"""TurboAdam training script: mirrors baseline.py with optimizer swapped.
 
 Overlay loss curves against baseline to verify convergence equivalence.
 Output: JSONL log at experiments/results/turboadam_log.jsonl
@@ -251,7 +251,7 @@ def main():
     print("Loading GPT-2 124M…")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token  # GPT-2 has no pad token
-    # Disable length warnings — we're concatenating tokens ourselves, not running
+    # Disable length warnings: we're concatenating tokens ourselves, not running
     # full articles through the model.
     tokenizer.model_max_length = int(1e30)
 
@@ -300,7 +300,7 @@ def main():
     )
 
     # -----------------------------------------------------------------------
-    # Optimizer — TurboAdam with same hyperparameters as baseline
+    # Optimizer: TurboAdam with same hyperparameters as baseline
     # -----------------------------------------------------------------------
     compress_m = not args.no_compress_m
     compress_v = not args.no_compress_v

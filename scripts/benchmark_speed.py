@@ -76,7 +76,7 @@ def _benchmark(opt_class, opt_kwargs, params, n_warmup: int = 50, n_measure: int
 
 def main():
     if not torch.cuda.is_available():
-        print("CUDA not available — benchmark requires GPU.")
+        print("CUDA not available: benchmark requires GPU.")
         return
 
     configs = [

@@ -1,4 +1,4 @@
-"""1Q — second moment (v) compression.
+"""1Q: second moment (v) compression.
 
 N-bit log-scale quantization for all parameters.
 Compress-every-step architecture.

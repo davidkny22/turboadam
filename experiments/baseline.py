@@ -1,4 +1,4 @@
-"""Baseline training script — standard AdamW on GPT-2 124M / WikiText-103.
+"""Baseline training script: standard AdamW on GPT-2 124M / WikiText-103.
 
 Ground truth for all TurboAdam convergence comparisons.
 Logs: loss curves, gradient norms, learning rate schedule.
@@ -167,7 +167,7 @@ def main():
     print("Loading GPT-2 124M…")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token  # GPT-2 has no pad token
-    # Disable length warnings — we're concatenating tokens ourselves, not running
+    # Disable length warnings: we're concatenating tokens ourselves, not running
     # full articles through the model.
     tokenizer.model_max_length = int(1e30)
 

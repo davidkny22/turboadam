@@ -1,8 +1,8 @@
-"""CoState — first moment (m) compression.
+"""CoState: first moment (m) compression.
 
 Gradient-residual decomposition: m = α·g + δ
-  - α = (m·g) / (g·g)  — scalar per parameter tensor
-  - δ = m - α·g        — residual orthogonal to current gradient
+  - α = (m·g) / (g·g)  : scalar per parameter tensor
+  - δ = m - α·g        : residual orthogonal to current gradient
 
 Residual δ is partitioned into 128-element blocks and classified:
   - Null costate    (r < τ₀): store 1 bit in bitmap
@@ -10,7 +10,7 @@ Residual δ is partitioned into 128-element blocks and classified:
   - Amplitude costate (r ≥ τ₁): store 1-bit sign + fp16 block scale
 
 Adaptive thresholds: τ₀ = P_10(r), τ₁ = P_90(r) per parameter tensor per step.
-No warmup required — EMA error-washing handles cold-start.
+No warmup required: EMA error-washing handles cold-start.
 """
 
 import math
@@ -35,7 +35,7 @@ def decompose(m: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     m_flat = m.reshape(-1)
     g_flat = g.reshape(-1)
     g_dot_g = g_flat.dot(g_flat)
-    # Keep alpha as a GPU scalar tensor — no .item() sync
+    # Keep alpha as a GPU scalar tensor: no .item() sync
     alpha = torch.where(
         g_dot_g > 0, m_flat.dot(g_flat) / g_dot_g, g_dot_g.new_zeros(())
     )
@@ -193,7 +193,7 @@ def _unpack_signs(packed: torch.Tensor, n: int) -> torch.Tensor:
         float32 tensor of length n with values +1 or -1.
     """
     # Ensure uint8 (PyTorch load_state_dict _cast may change dtype).
-    # Use vectorized bit extraction — no Python loop, stays on the original device.
+    # Use vectorized bit extraction: no Python loop, stays on the original device.
     # MPS doesn't support integer bitwise ops, so fall back to CPU for MPS only.
     orig_device = packed.device
     is_mps = orig_device.type == "mps"
@@ -298,7 +298,7 @@ def decode_blocks(
     signs_padded, _ = pad_to_blocks(signs_flat, block_size)
     signs_blocks = signs_padded.reshape(num_blocks, block_size)
 
-    # Compute per-block scale for each costate (vectorized — no Python loop):
+    # Compute per-block scale for each costate (vectorized: no Python loop):
     #   Null (0):      scale = 0
     #   Phase (1):     scale = block_norm / sqrt(block_size)
     #   Amplitude (2): scale = fp16 stored scale
@@ -325,7 +325,7 @@ def decode_blocks(
 
 
 # ---------------------------------------------------------------------------
-# CoStateManager — stateful per-step update loop (spec section 4.5)
+# CoStateManager: stateful per-step update loop (spec section 4.5)
 # ---------------------------------------------------------------------------
 
 
@@ -374,7 +374,7 @@ class CoStateManager:
         Returns:
             m_new: Updated first moment tensor, same shape as g.
         """
-        # Cast gradient to fp32 — CoState accumulators are fp32, and fp16/bf16
+        # Cast gradient to fp32: CoState accumulators are fp32, and fp16/bf16
         # gradients would cause dtype mismatches in dot products.
         g = g.float()
 

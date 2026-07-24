@@ -2,7 +2,7 @@
 
 ## Released
 
-### v0.1.0 — Production Release (Current)
+### v0.1.0: Production Release (Current)
 - Compress-every-step architecture (no freeze-refresh)
 - 4-bit log-scale v compression with stochastic rounding
 - CoState m compression (gradient-residual decomposition)
@@ -13,25 +13,25 @@
 
 ## Upcoming
 
-### v0.2.0 — Distributed Training Support
+### v0.2.0: Distributed Training Support
 - **FSDP compatibility:** Flatten CoStateManager state into plain tensors for `torch.distributed.fsdp.FullyShardedDataParallel`
 - **DeepSpeed ZeRO compatibility:** Ensure optimizer state shards correctly across ranks
 - DDP validation and performance testing
 - Add release CI workflow for tag-triggered build and publish via PyPI trusted publishing or token secret
 
-### v0.3.0 — Scale Validation
+### v0.3.0: Scale Validation
 - **7B model benchmark:** Validate convergence gap at 7B scale (Llama-2-7B or equivalent)
 - **70B model benchmark:** Memory and convergence validation at 70B scale
 - **AMP control experiment:** Matched-condition run with `torch.cuda.amp` enabled
 - Gap-shrinking hypothesis validation (does gap decrease at scale?)
 
-### v0.4.0 — Advanced Features
+### v0.4.0: Advanced Features
 - **3-bit v compression:** Test viability of 3-bit (8 buckets) for additional memory savings
 - **Multi-tensor Triton kernels:** Redesign without persistent buffer overhead
 - **CUDA graph support:** Resolve Triton internal allocation incompatibility
 - **Gradient compression composition:** Test GaLore + TurboAdam stacking
 
-### v1.0.0 — Stable
+### v1.0.0: Stable
 - Convergence gap ≤1% on all tested scales (125M–70B)
 - Full distributed training support (FSDP, DeepSpeed, DDP)
 - Production-grade documentation and tutorials

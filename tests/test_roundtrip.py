@@ -1,10 +1,12 @@
-"""Roundtrip fidelity tests — compression then reconstruction.
+"""Roundtrip fidelity tests: compression then reconstruction.
 
 Covers:
-- 2-bit log-scale quantize → dequantize error bounds
-- Costate encode → decode cosine similarity by tier
+- 2-bit log-scale quantize -> dequantize error bounds
+- Costate encode -> decode cosine similarity by tier
 - End-to-end: 100 optimizer steps, loss convergence vs. standard Adam
 """
+
+import math
 
 import torch
 import torch.nn as nn
@@ -96,7 +98,7 @@ class TestQuantizeRoundtrip:
 
 
 class TestCoStateRoundtrip:
-    """CoState encode/decode roundtrip — measure single-step m reconstruction fidelity."""
+    """CoState encode/decode roundtrip: measure single-step m reconstruction fidelity."""
 
     def test_cosine_similarity_single_step_roundtrip(self):
         """Single-step CoState encode → decode should preserve m direction (cosine > 0.60).
@@ -152,49 +154,38 @@ class TestCoStateRoundtrip:
         )
 
     def test_cosine_similarity_100_step_update(self):
-        """After 100 CoState update steps, the manager should have stable (non-diverging) state.
+        """After 100 CoState update steps, the reconstructed m should track the true EMA.
 
-        The CoStateManager applies EMA with compressed delta feedback.  This test
-        verifies that the output does not diverge (norm stays bounded relative to
-        gradient scale) and that cosine similarity between consecutive outputs
-        is non-trivially positive (i.e. the direction is not random noise).
+        The CoStateManager applies EMA with compressed delta feedback.  We compare
+        its output against an independent fp32 EMA accumulated on the same gradient
+        sequence.  In a slowly-rotating-gradient regime (where CoState's
+        reconstruction basis matches well), the relative L2 error must stay bounded.
         """
         torch.manual_seed(20)
         numel = 512
         mgr = CoStateManager(block_size=128)
         beta1 = 0.9
-
-        g_scale = 0.1
-        m_outputs = []
-        for _ in range(100):
-            g = torch.randn(numel) * g_scale
+        m_true = torch.zeros(numel)
+        errs = []
+        for step in range(100):
+            # Slow rotation: high cosine similarity between consecutive gradients,
+            # which is the regime where the gradient-basis reconstruction is accurate.
+            angle = step * 0.002
+            g = torch.zeros(numel)
+            g[: numel // 2] = math.cos(angle)
+            g[numel // 2 :] = math.sin(angle)
+            g = g + 0.001 * torch.randn(numel)
+            m_true = beta1 * m_true + (1.0 - beta1) * g
             m_hat = mgr.update(g, beta1)
-            m_outputs.append(m_hat.clone())
-
-        # Norm should be bounded — not more than 50x the gradient scale * numel^0.5
-        final_norm = m_outputs[-1].norm().item()
-        expected_max_norm = 50.0 * g_scale * (numel**0.5)
-        assert final_norm < expected_max_norm, (
-            f"CoState m norm {final_norm:.4f} exceeds expected bound {expected_max_norm:.4f} "
-            f"(potential divergence)"
+            if step >= 10:
+                rel = (m_hat - m_true).norm() / (m_true.norm() + 1e-8)
+                errs.append(rel.item())
+        assert max(errs) < 0.25, (
+            f"Max rel L2 to true EMA {max(errs):.4f} exceeds 0.25 "
+            f"(mean={sum(errs)/len(errs):.4f})"
         )
-
-        # Consecutive cosine similarity at late steps should be measurably non-trivial
-        # (better than random, i.e. > 0.0 on average for last 10 pairs)
-        late_cosines = []
-        for i in range(90, 99):
-            c = F.cosine_similarity(
-                m_outputs[i].unsqueeze(0),
-                m_outputs[i + 1].unsqueeze(0),
-            ).item()
-            late_cosines.append(c)
-        avg_late_cos = sum(late_cosines) / len(late_cosines)
-
-        # The gradient changes each step so consecutive m values won't be identical,
-        # but should not be random (anti-correlated). A mean > -0.5 is a loose sanity check.
-        assert avg_late_cos > -0.5, (
-            f"Average consecutive cosine similarity {avg_late_cos:.4f} is too negative "
-            f"(CoState output may be unstable)"
+        assert sum(errs) / len(errs) < 0.10, (
+            f"Mean rel L2 to true EMA {sum(errs)/len(errs):.4f} exceeds 0.10"
         )
 
     def test_costate_manager_updates_state(self):
@@ -283,42 +274,30 @@ def _run_training(optimizer_class, n_steps: int = 200, seed: int = 42, **opt_kwa
 class TestFullOptimizerVsAdam:
     """Full optimizer vs Adam on 2-layer MLP regression task."""
 
-    def test_final_loss_within_20_percent_of_adam(self):
-        """TurboAdam final loss should be within 20% of Adam's final loss.
+    def test_final_loss_within_30_percent_of_adam_across_seeds(self):
+        """TurboAdam final loss should be within 30% of Adam's across seeds.
 
-        Uses same random seed and same data. The 20% tolerance accounts for
-        compression error in both m (CoState) and v (1Q).
+        Uses same seed and same data per run. Empirically the per-seed relative
+        difference is < 21% across 5 seeds, so 30% gives teeth (a broken codec
+        that doubles the gap will fail) without flaking on small-noise runs.
         """
-        # Run Adam
-        adam_losses = _run_training(
-            torch.optim.Adam,
-            n_steps=200,
-            seed=42,
-        )
-
-        # Run TurboAdam from same seed
-        turbo_losses = _run_training(
-            TurboAdam,
-            n_steps=200,
-            seed=42,
-        )
-
-        adam_final = adam_losses[-1]
-        turbo_final = turbo_losses[-1]
-
-        # Both should converge (not diverge)
-        assert adam_final < 10.0, f"Adam diverged: final_loss={adam_final:.4f}"
-        assert turbo_final < 10.0, f"TurboAdam diverged: final_loss={turbo_final:.4f}"
-
-        # Within 20% relative difference
-        # Use symmetric relative difference: |a - b| / max(|a|, |b|)
-        rel_diff = abs(adam_final - turbo_final) / (
-            max(abs(adam_final), abs(turbo_final)) + 1e-8
-        )
-
-        assert rel_diff < 0.80, (
-            f"Final loss relative difference {rel_diff:.4f} exceeds 80% tolerance. "
-            f"Adam={adam_final:.4f}, TurboAdam={turbo_final:.4f}"
+        rel_diffs = []
+        for seed in range(5):
+            adam_losses = _run_training(torch.optim.Adam, n_steps=200, seed=seed)
+            turbo_losses = _run_training(TurboAdam, n_steps=200, seed=seed)
+            adam_final = adam_losses[-1]
+            turbo_final = turbo_losses[-1]
+            assert adam_final < 10.0, f"Adam diverged (seed {seed}): {adam_final:.4f}"
+            assert turbo_final < 10.0, (
+                f"TurboAdam diverged (seed {seed}): {turbo_final:.4f}"
+            )
+            rel_diff = abs(adam_final - turbo_final) / (
+                max(abs(adam_final), abs(turbo_final)) + 1e-8
+            )
+            rel_diffs.append(rel_diff)
+        assert max(rel_diffs) < 0.30, (
+            f"Max rel diff {max(rel_diffs):.4f} exceeds 0.30; "
+            f"per-seed diffs={[f'{d:.3f}' for d in rel_diffs]}"
         )
 
     def test_both_optimizers_decrease_loss(self):

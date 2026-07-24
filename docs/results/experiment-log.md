@@ -2,7 +2,7 @@
 
 ## Origin and Question
 
-Adam stores two full-precision copies of every parameter — first moment (m, 4 bytes/param) and second moment (v, 4 bytes/param). For a 7B model, optimizer state alone consumes **28 GB**, often the memory bottleneck that forces smaller batch sizes or shorter context lengths.
+Adam stores two full-precision copies of every parameter: first moment (m, 4 bytes/param) and second moment (v, 4 bytes/param). For a 7B model, optimizer state alone consumes **28 GB**, often the memory bottleneck that forces smaller batch sizes or shorter context lengths.
 
 The core question: can Adam's optimizer states be compressed **in-place during training** without breaking convergence? Standard approaches (SVD, low-rank projection) minimize aggregate Frobenius error but provide no per-element bounds. For Adam's denominator `sqrt(v) + eps`, a single element collapsing to zero causes division-by-zero and training divergence. The gap between aggregate and per-element error guarantees is the critical obstacle.
 
@@ -73,7 +73,7 @@ CoState-m alone converges essentially identically to AdamW. The first-moment com
 
 **Zero NaN. Zero spikes. All within noise.** The +0.51 at 8-bit matched CoState-only (+0.52), meaning v compression contributed essentially zero additional loss at 8-bit. 4-bit at +0.77 with 10.2× compression was declared the sweet spot.
 
-**Why theory failed:** Quantization errors are correlated — same elements map to the same buckets step-to-step after v stabilizes. Correlated noise does not accumulate like independent noise.
+**Why theory failed:** Quantization errors are correlated: same elements map to the same buckets step-to-step after v stabilizes. Correlated noise does not accumulate like independent noise.
 
 ### Decision Log
 
@@ -100,7 +100,7 @@ CoState-m alone converges essentially identically to AdamW. The first-moment com
 
 **Key finding:** The gap is almost entirely from CoState m compression. v compression at 4-bit is effectively free. The m+v combination shows partial error washing (m-only +0.52, m+v +0.77, but v-only +0.00), suggesting the two compressions' errors are not purely additive.
 
-**CoState distribution:** Stabilized immediately at 10% null, 80% phase, 10% amplitude — matching the P10/P90 threshold design.
+**CoState distribution:** Stabilized immediately at 10% null, 80% phase, 10% amplitude: matching the P10/P90 threshold design.
 
 ### Decision Log
 
@@ -214,7 +214,7 @@ The 3.69× plateau (multi-block v + sequential optimizer + no Triton CoState enc
 
 1. **Double replay:** `torch.cuda.graph()` both captures AND executes. Step 3 ran twice. Fixed by removing extra `.replay()`.
 2. **Step 1 v initialization split:** First gradient double-counted in v. Fixed by initializing compressed_v with 1e-30 instead of g².
-3. **The real regression:** Even with both bugs fixed, graph still gave +1.90. A controlled experiment showed the old (Apr 18) code gave +0.26 on new data, while current code gave +1.90. The regression was in code changes, not the graph itself — but graph ON vs OFF was the variable.
+3. **The real regression:** Even with both bugs fixed, graph still gave +1.90. A controlled experiment showed the old (Apr 18) code gave +0.26 on new data, while current code gave +1.90. The regression was in code changes, not the graph itself, but graph ON vs OFF was the variable.
 4. **Split-graph architecture:** CoState runs eagerly, m_new copied to graph-stable buffers, v+weight in graph. Result: +1.90.
 5. **Root cause identified:** Triton kernels allocate internal temporaries during each call. CUDA graphs capture these allocation addresses and replay to the same addresses, but temporaries from one step's encode become stale inputs for the next step's decode. **Inherent incompatibility between dynamic-allocation Triton kernels and CUDA graph replay.**
 
@@ -278,7 +278,7 @@ The 3.69× plateau (multi-block v + sequential optimizer + no Triton CoState enc
 
 **Speed:** AdamW 4.26 s/step, TurboAdam 4.45 s/step (**+4.5%**).
 
-**Key finding:** The gap **shrinks monotonically** over training. Early steps show large gaps (+2.94 at step 50) because CoState starts from zero and must build its encoded representation from cold. By step 200 the gap is +0.36; by step 500 it is **+0.25 (1.2% relative)** — within run-to-run noise for language modeling at this scale.
+**Key finding:** The gap **shrinks monotonically** over training. Early steps show large gaps (+2.94 at step 50) because CoState starts from zero and must build its encoded representation from cold. By step 200 the gap is +0.36; by step 500 it is **+0.25 (1.2% relative)**: within run-to-run noise for language modeling at this scale.
 
 ### Decision Log
 
@@ -311,7 +311,7 @@ The 3.69× plateau (multi-block v + sequential optimizer + no Triton CoState enc
 | TurboAdam (v only) | 8.4 ms | **0.70×** |
 | TurboAdam (m+v, default) | 17.0 ms | **1.41×** |
 
-**Key finding:** The v-only path is actually **faster** than AdamW (0.70×) because 4-bit log-scale decompression is cheaper than full fp32 EMA updates on small tensors. The m+v path adds ~40% overhead from CoState encode/decode. Persistent buffer removal (_static_grad, _v_out, _rand_buf) was critical — before removal, buffers added 12 bytes/param, completely negating compression savings.
+**Key finding:** The v-only path is actually **faster** than AdamW (0.70×) because 4-bit log-scale decompression is cheaper than full fp32 EMA updates on small tensors. The m+v path adds ~40% overhead from CoState encode/decode. Persistent buffer removal (_static_grad, _v_out, _rand_buf) was critical: before removal, buffers added 12 bytes/param, completely negating compression savings.
 
 ### Decision Log
 
