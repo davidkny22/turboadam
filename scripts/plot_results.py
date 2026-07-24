@@ -104,7 +104,7 @@ def plot_loss_overlay(
 
     ax.set_xlabel("Step")
     ax.set_ylabel("Loss (cross-entropy)")
-    ax.set_title("TurboAdam vs AdamW — Loss Curves (GPT-2 124M / WikiText-103)")
+    ax.set_title("TurboAdam vs AdamW: Loss Curves (GPT-2 124M / WikiText-103)")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -125,7 +125,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     output_path = os.path.join(args.output_dir, "loss_overlay.png")
 
-    # Load logs — both must exist
+    # Load logs: both must exist
     if not os.path.isfile(args.baseline_log):
         raise FileNotFoundError(f"Baseline log not found: {args.baseline_log}")
     if not os.path.isfile(args.turboadam_log):

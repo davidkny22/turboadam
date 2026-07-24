@@ -608,10 +608,10 @@ class TestStateDict:
     def test_load_state_dict_migrates_costate_manager_tensors(self):
         """load_state_dict must move CoStateManager internal tensors to param device.
 
-        CoStateManager stores _alpha, _encoded tensors, and _ef_residual on
-        whatever device they were created on. After load_state_dict, these must
-        sit on the parameter's device or downstream kernels fail with a device
-        mismatch. We exercise the non-empty-error-feedback path too.
+        CoStateManager persists _alpha, _encoded tensors, and an optional
+        _ef_residual. After load_state_dict, all must sit on the parameter's
+        device or downstream kernels fail with a device mismatch. Exercises the
+        error_feedback=True path that populates _ef_residual too.
         """
         torch.manual_seed(0)
         x = nn.Parameter(torch.randn(64, 64))  # large enough to use CoState
@@ -624,22 +624,22 @@ class TestStateDict:
 
         mgr = opt.state[x]["m_mgr"]
         assert mgr._encoded is not None
-        assert mgr._ef_residual is not None  # error_feedback populated _ef_residual
+        assert mgr._ef_residual is not None
 
         x2 = nn.Parameter(x.data.clone())
         opt2 = TurboAdam([x2], lr=1e-2, error_feedback=True)
         opt2.load_state_dict(state)
         mgr2 = opt2.state[x2]["m_mgr"]
         assert isinstance(mgr2._alpha, torch.Tensor)
-        # All CoState tensors must be on the same device as the param.
         expected_device = x2.device
         assert mgr2._alpha.device == expected_device
-        for key in ("labels", "sign_packed", "block_norms", "scales"):
+        # Compact CoState state has only sign_packed and block_norms; labels
+        # are encoded in the sign of block_norms and scales are derived on decode.
+        for key in mgr2._encoded:
             assert mgr2._encoded[key].device == expected_device, (
                 f"{key} not migrated to {expected_device}"
             )
         assert mgr2._ef_residual.device == expected_device
-        # Stepping after load must not raise (proves tensors are usable).
         opt2.zero_grad()
         (x2**2).sum().backward()
         opt2.step()

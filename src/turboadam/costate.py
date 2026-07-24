@@ -4,41 +4,188 @@ Gradient-residual decomposition: m = α·g + δ
   - α = (m·g) / (g·g)  : scalar per parameter tensor
   - δ = m - α·g        : residual orthogonal to current gradient
 
-Residual δ is partitioned into 128-element blocks and classified:
-  - Null costate    (r < τ₀): store 1 bit in bitmap
-  - Phase costate   (τ₀ ≤ r < τ₁): store 1-bit sign per element
-  - Amplitude costate (r ≥ τ₁): store 1-bit sign + fp16 block scale
+Residual δ is partitioned into blocks and classified:
+  - Null costate       (r < τ₀): reconstruct zero residual
+  - Phase costate      (τ₀ ≤ r < τ₁): sign + block RMS magnitude
+  - Amplitude costate  (r ≥ τ₁): sign + block RMS magnitude
+
+The prior implementation persisted both an fp32 block norm and an fp16 copy of
+that norm divided by sqrt(block_size). The fp16 amplitude value is derived on
+decode instead, preserving the existing numerics without storing it twice. In
+manager state, labels are encoded directly in the norm value: null stores +0,
+phase stores +norm, and amplitude stores -norm. The magnitude is unchanged for
+every block that uses it, and null-block magnitudes were never decoded.
 
 Adaptive thresholds: τ₀ = P_10(r), τ₁ = P_90(r) per parameter tensor per step.
 No warmup required: EMA error-washing handles cold-start.
 """
 
+from __future__ import annotations
+
 import math
+
 import torch
 
-from turboadam.utils import pad_to_blocks, BLOCK_SIZE
+from turboadam.utils import BLOCK_SIZE, pad_to_blocks
+
+try:
+    from turboadam.triton_kernels import (
+        triton_costate_decode as _triton_costate_decode,
+        triton_costate_encode as _triton_costate_encode,
+        triton_decompose_ratios as _triton_decompose_ratios,
+        triton_projection_alpha as _triton_projection_alpha,
+    )
+
+    _HAS_TRITON = True
+except (ImportError, ModuleNotFoundError):
+    _HAS_TRITON = False
+    _triton_costate_decode = None
+    _triton_costate_encode = None
+    _triton_decompose_ratios = None
+    _triton_projection_alpha = None
+
+
+def _scaled_projection_alpha(
+    m_flat: torch.Tensor, g_flat: torch.Tensor
+) -> torch.Tensor:
+    """Bounded-memory projection fallback for devices without safe fp64 dots."""
+    m_scale = m_flat.abs().amax()
+    g_scale = g_flat.abs().amax()
+    if not bool(g_scale > 0):
+        return g_scale.new_zeros(())
+
+    numerator = g_scale.new_zeros(())
+    denominator = g_scale.new_zeros(())
+    chunk = 1 << 20
+    for start in range(0, g_flat.numel(), chunk):
+        m_part = m_flat[start : start + chunk] / m_scale.clamp_min(
+            m_scale.new_tensor(2.0**-149)
+        )
+        g_part = g_flat[start : start + chunk] / g_scale
+        numerator.add_(m_part.dot(g_part))
+        denominator.add_(g_part.dot(g_part))
+
+    safe_denominator = denominator.clamp_min(torch.finfo(denominator.dtype).tiny)
+    alpha = (m_scale / g_scale) * (numerator / safe_denominator)
+    return torch.where(denominator > 0, alpha, alpha.new_zeros(()))
+
+
+def _projection_alpha(m: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    """Return the scalar least-squares projection coefficient of m onto g."""
+    m_flat = m.reshape(-1)
+    g_flat = g.reshape(-1)
+    if _HAS_TRITON and m.is_cuda and g.is_cuda:
+        return _triton_projection_alpha(m_flat, g_flat)
+
+    g_dot_g = g_flat.dot(g_flat)
+    m_dot_g = m_flat.dot(g_flat)
+
+    # The ordinary fp32 dots are both faster and bit-for-bit compatible with
+    # the original implementation. Fall back only when they overflow, or when
+    # a nonzero gradient is so small that g·g underflows to zero.
+    needs_fallback = not bool(torch.isfinite(g_dot_g)) or not bool(
+        torch.isfinite(m_dot_g)
+    )
+    if not needs_fallback and g_dot_g == 0:
+        needs_fallback = bool(torch.count_nonzero(g_flat))
+
+    if needs_fallback:
+        if m.device.type != "cpu":
+            return _scaled_projection_alpha(m_flat, g_flat)
+
+        # Chunked fp64 reductions bound temporary memory. CPU float64 is exact
+        # enough for every finite fp32 product and avoids both overflow and
+        # underflow in the projection scalar.
+        numerator = torch.zeros((), dtype=torch.float64, device=m.device)
+        denominator = torch.zeros((), dtype=torch.float64, device=m.device)
+        chunk = 1 << 20
+        for start in range(0, g_flat.numel(), chunk):
+            m_part = m_flat[start : start + chunk].double()
+            g_part = g_flat[start : start + chunk].double()
+            numerator.add_(m_part.dot(g_part))
+            denominator.add_(g_part.dot(g_part))
+        if denominator == 0:
+            return g_dot_g.new_zeros(())
+        return (numerator / denominator).to(dtype=g_dot_g.dtype)
+
+    # clamp_min avoids evaluating 0/0 inside torch.where. The final where keeps
+    # the exact zero-gradient convention alpha=0 without a host synchronization.
+    safe_denominator = g_dot_g.clamp_min(torch.finfo(g_dot_g.dtype).tiny)
+    alpha = m_dot_g / safe_denominator
+    return torch.where(g_dot_g > 0, alpha, g_dot_g.new_zeros(()))
+
+
+def _scaled_block_norms(blocks: torch.Tensor) -> torch.Tensor:
+    """Compute finite fp32 block norms without squaring overflow/underflow."""
+    block_scale = blocks.abs().amax(dim=1)
+    min_subnormal = block_scale.new_tensor(2.0**-149)
+    safe_scale = block_scale.clamp_min(min_subnormal)
+    unit = blocks / safe_scale.unsqueeze(1)
+    factor = torch.sqrt(torch.sum(unit * unit, dim=1))
+
+    # The true norm can exceed fp32 even when every element is finite. Saturate
+    # only that unrepresentable case instead of emitting inf into the codec.
+    max_value = torch.finfo(blocks.dtype).max
+    bounded_scale = torch.minimum(
+        block_scale, max_value / factor.clamp_min(1.0)
+    )
+    return torch.where(block_scale > 0, bounded_scale * factor, 0.0)
+
+
+def _block_norms(blocks: torch.Tensor) -> torch.Tensor:
+    """Use the original fast norm when safe, with a scaled rare-case fallback."""
+    norms = torch.linalg.vector_norm(blocks, dim=1)
+    nonfinite = ~torch.isfinite(norms)
+    zero_norm = norms == 0
+
+    if blocks.device.type == "cpu":
+        # Avoid another full read of ordinary nonzero blocks. Only distinguish
+        # true zero blocks from underflow after the cheap norm checks request it.
+        if not bool(nonfinite.any()) and not bool(zero_norm.any()):
+            return norms
+        nonzero_blocks = blocks.ne(0).any(dim=1)
+    else:
+        nonzero_blocks = blocks.ne(0).any(dim=1)
+
+    bad = nonfinite | (zero_norm & nonzero_blocks)
+    stable = _scaled_block_norms(blocks)
+    return torch.where(bad, stable, norms)
+
+
+def _scaled_block_ratios(
+    delta_blocks: torch.Tensor, m_blocks: torch.Tensor
+) -> torch.Tensor:
+    """Compute block-norm ratios without materializing overflowing norms."""
+    delta_scale = delta_blocks.abs().amax(dim=1)
+    m_scale = m_blocks.abs().amax(dim=1)
+    min_subnormal = delta_scale.new_tensor(2.0**-149)
+
+    delta_safe = delta_scale.clamp_min(min_subnormal)
+    m_safe = m_scale.clamp_min(min_subnormal)
+    delta_unit = delta_blocks / delta_safe.unsqueeze(1)
+    m_unit = m_blocks / m_safe.unsqueeze(1)
+    delta_factor = torch.sqrt(torch.sum(delta_unit * delta_unit, dim=1))
+    m_factor = torch.sqrt(torch.sum(m_unit * m_unit, dim=1))
+
+    log_ratio = (
+        delta_safe.log()
+        - m_safe.log()
+        + delta_factor.clamp_min(min_subnormal).log()
+        - m_factor.clamp_min(min_subnormal).log()
+    )
+    max_log = math.log(torch.finfo(torch.float32).max)
+    ratio = log_ratio.clamp_max(max_log).exp()
+    return torch.where(
+        (delta_scale > 0) & (m_scale > 0), ratio, torch.zeros_like(ratio)
+    )
 
 
 def decompose(m: torch.Tensor, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Decompose momentum into gradient-aligned component and residual.
+    """Decompose momentum into a gradient-aligned component and residual.
 
     m = α·g + δ  where α = (m·g) / (g·g)
-
-    Args:
-        m: First moment tensor (any shape, will be treated as flat).
-        g: Gradient tensor (same shape as m).
-
-    Returns:
-        (alpha, delta) where alpha is a scalar tensor (0-dim) and delta has
-        the same shape as m.
     """
-    m_flat = m.reshape(-1)
-    g_flat = g.reshape(-1)
-    g_dot_g = g_flat.dot(g_flat)
-    # Keep alpha as a GPU scalar tensor: no .item() sync
-    alpha = torch.where(
-        g_dot_g > 0, m_flat.dot(g_flat) / g_dot_g, g_dot_g.new_zeros(())
-    )
+    alpha = _projection_alpha(m, g)
     delta = m - alpha * g
     return alpha, delta
 
@@ -52,38 +199,42 @@ def compute_block_ratios(
     delta: torch.Tensor,
     m: torch.Tensor,
     block_size: int = BLOCK_SIZE,
-) -> torch.Tensor:
-    """Compute per-block ratio r = norm(delta_block) / norm(m_block).
+    *,
+    return_delta_norms: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Compute r = norm(delta_block) / norm(m_block) per block.
 
-    Args:
-        delta:      Residual tensor (any shape).
-        m:          First moment tensor (same shape as delta).
-        block_size: Elements per block (default: BLOCK_SIZE = 128).
-
-    Returns:
-        1-D float32 tensor of length num_blocks, each entry in [0, ∞).
-        Blocks where norm(m_block) == 0 get ratio 0.
+    ``return_delta_norms`` lets CoState reuse the already-computed residual
+    norms during encoding, avoiding a second full block reduction.
     """
     delta_flat = delta.reshape(-1).float()
     m_flat = m.reshape(-1).float()
+    if delta_flat.numel() == 0:
+        empty = delta_flat.new_empty(0)
+        return (empty, empty) if return_delta_norms else empty
 
-    delta_padded, orig_len = pad_to_blocks(delta_flat, block_size)
+    delta_padded, _ = pad_to_blocks(delta_flat, block_size)
     m_padded, _ = pad_to_blocks(m_flat, block_size)
+    delta_blocks = delta_padded.reshape(-1, block_size)
+    m_blocks = m_padded.reshape(-1, block_size)
 
-    num_blocks = delta_padded.shape[0] // block_size
-    delta_blocks = delta_padded.reshape(num_blocks, block_size)
-    m_blocks = m_padded.reshape(num_blocks, block_size)
+    delta_norms = _block_norms(delta_blocks)
+    m_norms = _block_norms(m_blocks)
+    safe_m_norms = m_norms.clamp_min(m_norms.new_tensor(2.0**-149))
+    ratios = torch.where(m_norms > 0, delta_norms / safe_m_norms, 0.0)
 
-    delta_norms = delta_blocks.norm(dim=1)  # (num_blocks,)
-    m_norms = m_blocks.norm(dim=1)  # (num_blocks,)
+    max_value = torch.finfo(ratios.dtype).max
+    saturation_floor = max_value * 0.5
+    suspect = (
+        (delta_norms >= saturation_floor)
+        | (m_norms >= saturation_floor)
+        | ~torch.isfinite(ratios)
+    )
+    if delta_blocks.device.type != "cpu" or bool(suspect.any()):
+        stable_ratios = _scaled_block_ratios(delta_blocks, m_blocks)
+        ratios = torch.where(suspect, stable_ratios, ratios)
 
-    # Guard: where m_norm is zero, ratio is 0
-    safe_m_norms = m_norms.clone()
-    safe_m_norms[safe_m_norms == 0.0] = 1.0  # avoid division by zero
-    ratios = delta_norms / safe_m_norms
-    ratios[m_norms == 0.0] = 0.0
-
-    return ratios
+    return (ratios, delta_norms) if return_delta_norms else ratios
 
 
 # ---------------------------------------------------------------------------
@@ -96,26 +247,25 @@ def compute_thresholds(
     null_pct: float = 0.10,
     amp_pct: float = 0.90,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute adaptive thresholds as percentiles of ratios.
+    """Compute exact adaptive percentile thresholds without interpolation.
 
-    Default P10/P90 gives 10% null, 80% phase, 10% amplitude.
-
-    Uses sort+index instead of torch.quantile for ~4x speedup on GPU.
-    Returns scalar tensors (no .item() sync).
-
-    Args:
-        ratios: 1-D float tensor of per-block ratios.
-        null_pct: Percentile for null/phase boundary. Default: 0.10 (P10).
-        amp_pct: Percentile for phase/amplitude boundary. Default: 0.90 (P90).
-
-    Returns:
-        (tau0, tau1) as scalar tensors on the same device as ratios.
+    Small tensors use one sort because it has lower launch overhead. Larger
+    tensors use two order-statistic selections, avoiding a full O(n log n) sort
+    and its full sorted output allocation.
     """
-    sorted_r = ratios.sort().values
-    n = sorted_r.shape[0]
+    n = ratios.numel()
+    if n == 0:
+        raise ValueError("cannot compute CoState thresholds for an empty tensor")
+
     idx_lo = max(0, int(null_pct * n) - 1)
     idx_hi = min(n - 1, int(amp_pct * n))
-    return sorted_r[idx_lo], sorted_r[idx_hi]
+    if n < 512:
+        sorted_r = ratios.sort().values
+        return sorted_r[idx_lo], sorted_r[idx_hi]
+
+    tau0 = ratios.kthvalue(idx_lo + 1).values
+    tau1 = ratios.kthvalue(idx_hi + 1).values
+    return tau0, tau1
 
 
 # ---------------------------------------------------------------------------
@@ -125,27 +275,12 @@ def compute_thresholds(
 
 def classify_blocks(
     ratios: torch.Tensor,
-    tau0: float,
-    tau1: float,
+    tau0: float | torch.Tensor,
+    tau1: float | torch.Tensor,
 ) -> torch.Tensor:
-    """Assign costate label to each block based on its ratio.
-
-    Labels:
-        0 (null)      : r < tau0
-        1 (phase)     : tau0 <= r < tau1
-        2 (amplitude) : r >= tau1
-
-    Args:
-        ratios: 1-D float tensor of per-block ratios.
-        tau0:   Lower threshold (10th percentile).
-        tau1:   Upper threshold (90th percentile).
-
-    Returns:
-        uint8 tensor of labels, same length as ratios.
-    """
-    labels = torch.zeros(ratios.shape[0], dtype=torch.uint8, device=ratios.device)
-    labels[ratios >= tau0] = 1  # phase (will be overwritten for amplitude)
-    labels[ratios >= tau1] = 2  # amplitude
+    """Assign uint8 labels 0=null, 1=phase, and 2=amplitude."""
+    labels = (ratios >= tau0).to(torch.uint8)
+    labels.add_((ratios >= tau1).to(torch.uint8))
     return labels
 
 
@@ -154,21 +289,13 @@ def classify_blocks(
 # ---------------------------------------------------------------------------
 
 
-def _pack_signs(values: torch.Tensor) -> torch.Tensor:
-    """Pack sign bits (1 if negative, 0 if non-negative) into uint8, 8 bits/byte.
-
-    Args:
-        values: 1-D float tensor of arbitrary length.
-
-    Returns:
-        uint8 tensor of length ceil(len(values) / 8).
-    """
-    n = values.shape[0]
-    pad = (8 - n % 8) % 8
-    if pad > 0:
-        values = torch.cat([values, values.new_zeros(pad)])
+def _pack_signs(values: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """Pack sign bits (1 if negative, 0 otherwise) into uint8 bytes."""
+    n = values.numel()
+    pad = (-n) % 8
+    if pad:
+        values = torch.cat((values, values.new_zeros(pad)))
     sign_bits = (values < 0).to(torch.uint8).reshape(-1, 8)
-    # Pack via bitwise shifts (avoids creating multiplier tensor each call)
     packed = (
         (sign_bits[:, 0] << 7)
         | (sign_bits[:, 1] << 6)
@@ -179,83 +306,99 @@ def _pack_signs(values: torch.Tensor) -> torch.Tensor:
         | (sign_bits[:, 6] << 1)
         | sign_bits[:, 7]
     )
+    if out is not None:
+        if out.shape != packed.shape or out.dtype != torch.uint8:
+            raise ValueError("sign output buffer has incompatible shape or dtype")
+        out.copy_(packed)
+        return out
     return packed
 
 
 def _unpack_signs(packed: torch.Tensor, n: int) -> torch.Tensor:
-    """Unpack sign bits from uint8 bytes back to +1/-1 float values.
-
-    Args:
-        packed: uint8 tensor of packed sign bytes.
-        n:      Number of elements to unpack (may be less than len(packed)*8).
-
-    Returns:
-        float32 tensor of length n with values +1 or -1.
-    """
-    # Ensure uint8 (PyTorch load_state_dict _cast may change dtype).
-    # Use vectorized bit extraction: no Python loop, stays on the original device.
-    # MPS doesn't support integer bitwise ops, so fall back to CPU for MPS only.
+    """Unpack uint8 sign bytes to +1/-1 fp32 values."""
     orig_device = packed.device
     is_mps = orig_device.type == "mps"
     work_device = torch.device("cpu") if is_mps else orig_device
 
     packed_int = packed.to(dtype=torch.int32, device=work_device)
-    shifts = torch.tensor(
-        [7, 6, 5, 4, 3, 2, 1, 0], dtype=torch.int32, device=work_device
-    )
-    # (num_bytes, 8): extract all 8 bits per byte in one shot
-    bits = ((packed_int.unsqueeze(1) >> shifts.unsqueeze(0)) & 1).float()
-    bits = bits.reshape(-1)[:n]
-    signs = 1.0 - 2.0 * bits
-    return signs.to(orig_device)
+    shifts = torch.arange(7, -1, -1, dtype=torch.int32, device=work_device)
+    bits = ((packed_int.unsqueeze(1) >> shifts) & 1).reshape(-1)[:n].float()
+    return (1.0 - 2.0 * bits).to(orig_device)
 
 
 def encode_blocks(
     delta: torch.Tensor,
     labels: torch.Tensor,
     block_size: int = BLOCK_SIZE,
+    *,
+    out: dict | None = None,
+    include_legacy_scale: bool = True,
+    compact_labels: bool = False,
+    block_norms: torch.Tensor | None = None,
 ) -> dict:
-    """Encode delta into per-block compressed representation.
+    """Encode a residual into labels, packed signs, and fp32 block norms.
 
-    Args:
-        delta:      Residual tensor (any shape, flattened internally).
-        labels:     uint8 costate labels, one per block.
-        block_size: Elements per block.
-
-    Returns:
-        dict with:
-            labels      (uint8)  : costate label per block
-            sign_packed (uint8)  : packed sign bits, ceil(numel/8) bytes
-            block_norms (float32): L2 norm of each delta block
-            scales      (float16): per-block amplitude scale = block_norm / sqrt(block_size),
-                                   stored as fp16.  This is the uniform per-element magnitude
-                                   that sign-only reconstruction (amplitude costate) uses.
+    ``include_legacy_scale=True`` preserves the old standalone function's
+    dictionary shape. CoStateManager disables it because ``scales`` is exactly
+    derivable from ``block_norms`` and therefore wastes persistent memory. It
+    also enables ``compact_labels`` to encode each costate in the sign/value of
+    its existing fp32 norm, with no additional persistent label tensor.
     """
     delta_flat = delta.reshape(-1).float()
+    num_blocks = (delta_flat.numel() + block_size - 1) // block_size
+    if block_norms is None:
+        delta_padded, _ = pad_to_blocks(delta_flat, block_size)
+        delta_blocks = delta_padded.reshape(-1, block_size)
+        block_norms_new = _block_norms(delta_blocks).float()
+    else:
+        if block_norms.numel() != num_blocks:
+            raise ValueError("precomputed block_norms has an incompatible length")
+        block_norms_new = block_norms.reshape(-1).to(
+            device=delta.device, dtype=torch.float32
+        )
 
-    delta_padded, _ = pad_to_blocks(delta_flat, block_size)
-    num_blocks = delta_padded.shape[0] // block_size
-    delta_blocks = delta_padded.reshape(num_blocks, block_size)
+    if compact_labels:
+        # +0=null, +norm=phase, -norm=amplitude. A zero-magnitude phase
+        # collapsing to null is exactly equivalent because both decode to zero.
+        signed_norms_new = torch.where(
+            labels == 0,
+            torch.zeros_like(block_norms_new),
+            torch.where(labels == 2, -block_norms_new, block_norms_new),
+        )
+        if out is None:
+            encoded = {
+                "sign_packed": _pack_signs(delta_flat),
+                "block_norms": signed_norms_new,
+            }
+        else:
+            _pack_signs(delta_flat, out=out["sign_packed"])
+            out["block_norms"].copy_(signed_norms_new)
+            out.pop("labels", None)
+            out.pop("phase_packed", None)
+            encoded = out
+    elif out is None:
+        encoded = {
+            "labels": labels,
+            "sign_packed": _pack_signs(delta_flat),
+            "block_norms": block_norms_new,
+        }
+    else:
+        out["labels"].copy_(labels)
+        _pack_signs(delta_flat, out=out["sign_packed"])
+        out["block_norms"].copy_(block_norms_new)
+        out.pop("phase_packed", None)
+        encoded = out
 
-    # Per-block L2 norms
-    block_norms = delta_blocks.norm(dim=1).float()  # (num_blocks,)
+    if include_legacy_scale:
+        scale_new = (block_norms_new * (1.0 / math.sqrt(block_size))).to(torch.float16)
+        if out is not None and "scales" in out:
+            out["scales"].copy_(scale_new)
+        else:
+            encoded["scales"] = scale_new
+    else:
+        encoded.pop("scales", None)
 
-    # Per-block fp16 amplitude scales: block_norm / sqrt(block_size).
-    # Storing the per-element uniform magnitude (rather than the block L2 norm) means
-    # amplitude decode is: scale * sign(delta_block), yielding the correct element magnitudes.
-    # Phase decode computes the same value on the fly from block_norms; amplitude stores it
-    # explicitly in fp16 so the scale is preserved with full fp16 precision.
-    scales = (block_norms / math.sqrt(block_size)).to(torch.float16)  # (num_blocks,)
-
-    # Pack sign bits for the original (un-padded) elements
-    sign_packed = _pack_signs(delta_flat)
-
-    return {
-        "labels": labels,
-        "sign_packed": sign_packed,
-        "block_norms": block_norms,
-        "scales": scales,
-    }
+    return encoded
 
 
 def decode_blocks(
@@ -263,89 +406,58 @@ def decode_blocks(
     alpha,
     g: torch.Tensor,
     block_size: int = BLOCK_SIZE,
-    original_numel: int = None,
+    original_numel: int | None = None,
 ) -> torch.Tensor:
-    """Reconstruct approximated m = alpha*g + delta_hat from encoded representation.
+    """Reconstruct m_hat = alpha*g + delta_hat from compressed CoState.
 
-    Per-costate delta_hat reconstruction:
-        Null (0)      : delta_hat_block = 0
-        Phase (1)     : delta_hat_block = (norm(delta_block)/sqrt(block_size)) * sign(delta_block)
-        Amplitude (2) : delta_hat_block = fp16_scale * sign(delta_block)
-
-    Args:
-        encoded:        dict returned by encode_blocks.
-        alpha:          Scalar float from decompose().
-        g:              Gradient tensor (same original shape as delta).
-        block_size:     Elements per block.
-        original_numel: Number of elements in the original delta (before padding).
-
-    Returns:
-        Reconstructed m tensor with the same shape as g.
+    Phase uses the fp32-derived RMS magnitude. Amplitude derives the same fp16
+    rounding that the old ``scales`` tensor stored, preserving old checkpoints'
+    numerical behavior without retaining the redundant tensor.
     """
     g_flat = g.reshape(-1).float()
     if original_numel is None:
-        original_numel = g_flat.shape[0]
+        original_numel = g_flat.numel()
+    if original_numel == 0:
+        return torch.empty_like(g, dtype=torch.float32)
 
     device = g_flat.device
-    labels = encoded["labels"].to(dtype=torch.uint8, device=device)
-    sign_packed = encoded["sign_packed"]
-    block_norms = encoded["block_norms"].to(dtype=torch.float32, device=device)
-    scales = encoded["scales"].to(dtype=torch.float32, device=device)
-    num_blocks = labels.shape[0]
+    sign_packed = encoded["sign_packed"].to(dtype=torch.uint8, device=device)
+    stored_norms = encoded["block_norms"].to(dtype=torch.float32, device=device)
+    num_blocks = (original_numel + block_size - 1) // block_size
 
-    # Unpack sign bits and reshape to block layout
+    if "labels" not in encoded:
+        # A negative zero amplitude may collapse to null: both decode to zero.
+        amplitude_mask = stored_norms < 0
+        block_norms = stored_norms.abs()
+        phase_mask = (~amplitude_mask) & (block_norms > 0)
+    else:
+        labels = encoded["labels"].to(dtype=torch.uint8, device=device)
+        phase_mask = labels == 1
+        amplitude_mask = labels == 2
+        block_norms = stored_norms
+
     signs_flat = _unpack_signs(sign_packed, original_numel)
     signs_padded, _ = pad_to_blocks(signs_flat, block_size)
     signs_blocks = signs_padded.reshape(num_blocks, block_size)
 
-    # Compute per-block scale for each costate (vectorized: no Python loop):
-    #   Null (0):      scale = 0
-    #   Phase (1):     scale = block_norm / sqrt(block_size)
-    #   Amplitude (2): scale = fp16 stored scale
-    # Build a (num_blocks,) scale tensor, then broadcast over block_size.
-    phase_scales = block_norms / math.sqrt(block_size)  # (num_blocks,)
-
-    # Build per-block scale: null→0, phase→phase_scale, amplitude→stored scale
-    # Use label as index: [0_scale, phase_scale, amp_scale] per block
-    block_scales = torch.zeros_like(phase_scales)
-    mask_phase = labels == 1
-    mask_amp = labels == 2
-    block_scales[mask_phase] = phase_scales[mask_phase]
-    block_scales[mask_amp] = scales[mask_amp]
-
-    # Broadcast: (num_blocks, 1) * (num_blocks, block_size) → (num_blocks, block_size)
-    delta_hat_blocks = (
-        block_scales.unsqueeze(1) * signs_blocks
-    )  # (num_blocks, block_size)
-
-    # Trim to original numel and reconstruct m
-    delta_hat = delta_hat_blocks.reshape(-1)[:original_numel]
-    result = alpha * g_flat + delta_hat
-    return result.reshape(g.shape)
+    phase_scales = block_norms / math.sqrt(block_size)
+    amplitude_scales = phase_scales.to(torch.float16).float()
+    block_scales = torch.where(
+        phase_mask,
+        phase_scales,
+        torch.where(amplitude_mask, amplitude_scales, 0.0),
+    )
+    delta_hat = (block_scales.unsqueeze(1) * signs_blocks).reshape(-1)[:original_numel]
+    return (alpha * g_flat + delta_hat).reshape(g.shape)
 
 
 # ---------------------------------------------------------------------------
-# CoStateManager: stateful per-step update loop (spec section 4.5)
+# CoStateManager: stateful per-step update loop
 # ---------------------------------------------------------------------------
 
 
 class CoStateManager:
-    """Stateful manager for CoState first moment compression.
-
-    Implements the per-step update procedure from spec section 4.5:
-      1. Load compressed δ̂ and costate bitmap from memory (if prior state exists)
-      2. Reconstruct m̃ = α · g + decompress(δ̂)   [skip on first call, use m̃ = 0]
-      3. Compute EMA update: m_new = β₁ · m̃ + (1 - β₁) · g
-      4. Compute new projection: α_new = (m_new · g) / (g · g)
-      5. Compute new residual: δ_new = m_new - α_new · g
-      6. Classify blocks into costates using adaptive thresholds
-      7. Compress and store δ̂_new according to costate assignments
-      8. Store updated costate bitmap and α_new
-
-    Usage:
-        mgr = CoStateManager(block_size=128)
-        m = mgr.update(g, beta1=0.9)  # call each optimizer step
-    """
+    """Stateful manager for CoState first-moment compression."""
 
     def __init__(
         self,
@@ -358,107 +470,101 @@ class CoStateManager:
         self._null_pct = null_pct
         self._amp_pct = amp_pct
         self._has_state: bool = False
-        self._alpha = 0.0  # becomes a scalar tensor after first update
+        self._alpha = 0.0
         self._encoded: dict | None = None
         self._original_numel: int = 0
         self._error_feedback = error_feedback
         self._ef_residual: torch.Tensor | None = None
 
     def update(self, g: torch.Tensor, beta1: float) -> torch.Tensor:
-        """Run one step of the CoState update procedure.
-
-        Args:
-            g:     Current gradient tensor (any shape).
-            beta1: EMA decay for first moment (e.g. 0.9).
-
-        Returns:
-            m_new: Updated first moment tensor, same shape as g.
-        """
-        # Cast gradient to fp32: CoState accumulators are fp32, and fp16/bf16
-        # gradients would cause dtype mismatches in dot products.
+        """Run one CoState reconstruction, EMA, decomposition, and encode step."""
         g = g.float()
+        if g.numel() == 0:
+            return torch.empty_like(g)
 
-        # Use Triton kernels if available and on CUDA
-        try:
-            from turboadam.triton_kernels import (
-                triton_costate_decode,
-                triton_costate_encode,
-                triton_decompose_ratios,
-            )
+        use_triton = _HAS_TRITON and g.is_cuda
+        decode = _triton_costate_decode if use_triton else decode_blocks
 
-            _use_triton = g.is_cuda
-        except ImportError:
-            _use_triton = False
-
-        _decode = triton_costate_decode if _use_triton else decode_blocks
-        _encode = triton_costate_encode if _use_triton else encode_blocks
-        _decompose_ratios = triton_decompose_ratios if _use_triton else None
-
-        # Step 1-2: Reconstruct m̃ from compressed prior state (or zeros on first call)
+        # Reconstruct the old state, then reuse that transient buffer for m_new.
         if self._has_state:
-            m_hat = _decode(
+            m_new = decode(
                 self._encoded,
                 self._alpha,
                 g,
                 self.block_size,
                 self._original_numel,
             )
+            if self._error_feedback and self._ef_residual is not None:
+                m_new.lerp_(g + self._ef_residual, 1.0 - beta1)
+            else:
+                # Adam's EMA written as lerp is one fused elementwise pass.
+                m_new.lerp_(g, 1.0 - beta1)
         else:
-            m_hat = torch.zeros_like(g, dtype=torch.float32)
+            if self._error_feedback and self._ef_residual is not None:
+                m_new = (g + self._ef_residual).mul(1.0 - beta1)
+            else:
+                m_new = g.clone().mul_(1.0 - beta1)
 
-        # Error feedback: compensate for previous step's encoding loss
-        if self._error_feedback and self._ef_residual is not None:
-            g_corrected = g + self._ef_residual
+        alpha_new = _projection_alpha(m_new, g)
+        if use_triton:
+            delta_new, ratios, block_norms = _triton_decompose_ratios(
+                m_new,
+                g,
+                alpha_new,
+                self.block_size,
+                return_block_norms=True,
+            )
         else:
-            g_corrected = g
+            delta_new = m_new - alpha_new * g
+            ratios, block_norms = compute_block_ratios(
+                delta_new,
+                m_new,
+                self.block_size,
+                return_delta_norms=True,
+            )
 
-        # Step 3: EMA update
-        m_new = beta1 * m_hat + (1.0 - beta1) * g_corrected
-
-        # Steps 4-6: Decompose + block ratios + classify
-        alpha_new, delta_new = decompose(m_new, g)
-        ratios = compute_block_ratios(delta_new, m_new, self.block_size)
         tau0, tau1 = compute_thresholds(ratios, self._null_pct, self._amp_pct)
         labels = classify_blocks(ratios, tau0, tau1)
 
-        # Steps 7-8: Compress and store
-        encoded_new = _encode(delta_new, labels, self.block_size)
+        if use_triton:
+            encoded_new = _triton_costate_encode(
+                delta_new,
+                labels,
+                self.block_size,
+                out=self._encoded,
+                include_legacy_scale=False,
+                compact_labels=True,
+                block_norms=block_norms,
+            )
+        else:
+            encoded_new = encode_blocks(
+                delta_new,
+                labels,
+                self.block_size,
+                out=self._encoded,
+                include_legacy_scale=False,
+                compact_labels=True,
+                block_norms=block_norms,
+            )
 
-        # Error feedback: measure what the encoding lost, accumulate for next step
+        # Optional error feedback is intentionally full precision and therefore
+        # trades away the memory benefit; it remains opt-in for ablation parity.
         if self._error_feedback:
-            zero_alpha = g.new_zeros(1)
-            delta_hat = _decode(
+            zero_alpha = g.new_zeros(())
+            delta_hat = decode(
                 encoded_new, zero_alpha, g, self.block_size, m_new.numel()
             )
             ef_error = (delta_new - delta_hat).detach()
             if self._ef_residual is None:
                 self._ef_residual = ef_error
             else:
-                self._ef_residual = beta1 * self._ef_residual + (1.0 - beta1) * ef_error
+                self._ef_residual.mul_(beta1).add_(ef_error, alpha=1.0 - beta1)
 
-        # Graph-stable buffer management: on first call allocate by cloning,
-        # on subsequent calls copy data in-place to keep tensor addresses stable.
-        if self._encoded is None:
-            # First step: allocate graph-stable buffers by cloning
-            self._alpha = (
-                alpha_new.clone() if isinstance(alpha_new, torch.Tensor) else alpha_new
-            )
-            self._encoded = {
-                "labels": encoded_new["labels"].clone(),
-                "sign_packed": encoded_new["sign_packed"].clone(),
-                "block_norms": encoded_new["block_norms"].clone(),
-                "scales": encoded_new["scales"].clone(),
-            }
+        if isinstance(self._alpha, torch.Tensor):
+            self._alpha.copy_(alpha_new)
         else:
-            if isinstance(self._alpha, torch.Tensor):
-                self._alpha.copy_(alpha_new)
-            else:
-                self._alpha = alpha_new
-            self._encoded["labels"].copy_(encoded_new["labels"])
-            self._encoded["sign_packed"].copy_(encoded_new["sign_packed"])
-            self._encoded["block_norms"].copy_(encoded_new["block_norms"])
-            self._encoded["scales"].copy_(encoded_new["scales"])
+            self._alpha = alpha_new.detach()
+        self._encoded = encoded_new
         self._original_numel = m_new.numel()
         self._has_state = True
-
         return m_new
