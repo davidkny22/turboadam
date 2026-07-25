@@ -1,0 +1,7 @@
+include LICENSE
+include README.md
+include ROADMAP.md
+recursive-include benchmarks *.py
+recursive-include experiments *.py
+recursive-include scripts *.py
+recursive-include tests *.py

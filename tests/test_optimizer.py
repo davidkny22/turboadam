@@ -1,850 +1,311 @@
-"""Integration tests for TurboAdam optimizer: compress-every-step architecture.
+from __future__ import annotations
 
-Covers:
-- API compatibility with torch.optim.Adam
-- Convergence on a simple quadratic loss
-- State structure (compressed v, CoState m)
-- Closeness to standard Adam within tolerance
-- Ablation flags (compress_m, compress_v)
-"""
+import copy
+import io
+import warnings
 
 import pytest
 import torch
-import torch.nn as nn
 
 from turboadam import TurboAdam
-from turboadam.oneq import decompress_v
+from turboadam.utils import state_tensor_bytes
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
-def _make_params(seed=42):
-    """Return a list of parameters initialized from a fixed seed."""
-    torch.manual_seed(seed)
-    return [
-        torch.nn.Parameter(torch.randn(10, 10)),
-        torch.nn.Parameter(torch.randn(20)),
-    ]
-
-
-def _step_with_grad(opt, params):
-    """Run one step with fresh random gradients."""
-    for p in params:
-        p.grad = torch.randn_like(p)
-    opt.step()
-
-
-# ---------------------------------------------------------------------------
-# 1. API compatibility
-# ---------------------------------------------------------------------------
-
-
-class TestAPICompatibility:
-    def test_accepts_adam_args(self):
-        params = _make_params()
-        opt = TurboAdam(
-            params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2
-        )
-        assert opt.defaults["lr"] == 1e-3
-        assert opt.defaults["betas"] == (0.9, 0.999)
-        assert opt.defaults["eps"] == 1e-8
-        assert opt.defaults["weight_decay"] == 1e-2
-
-    def test_accepts_turboadam_args(self):
-        params = _make_params()
-        opt = TurboAdam(params, block_size=64, v_bits=6)
-        assert opt.defaults["block_size"] == 64
-        assert opt.defaults["v_bits"] == 6
-
-    def test_default_args(self):
-        params = _make_params()
-        opt = TurboAdam(params)
-        assert opt.defaults["lr"] == 1e-3
-        assert opt.defaults["betas"] == (0.9, 0.999)
-        assert opt.defaults["eps"] == 1e-8
-        assert opt.defaults["weight_decay"] == 0.0
-        assert opt.defaults["block_size"] == 128
-        assert opt.defaults["v_bits"] == 4
-        assert opt.defaults["compress_m"] is True
-        assert opt.defaults["compress_v"] is True
-
-    def test_step_callable(self):
-        params = _make_params()
-        opt = TurboAdam(params)
-        for p in params:
-            p.grad = torch.randn_like(p)
-        opt.step()
-
-
-# ---------------------------------------------------------------------------
-# 2. Convergence on quadratic f(x) = sum(x^2)
-# ---------------------------------------------------------------------------
-
-
-class TestConvergence:
-    def test_converges_quadratic_200_steps(self):
-        """TurboAdam should drive sum(x^2) close to 0 within 200 steps."""
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.randn(50))
-        opt = TurboAdam([x], lr=1e-2)
-
-        initial_loss = (x**2).sum().item()
-        for _ in range(200):
-            opt.zero_grad()
-            loss = (x**2).sum()
-            loss.backward()
-            opt.step()
-
-        final_loss = (x**2).sum().item()
-        assert final_loss < 0.10 * initial_loss, (
-            f"Expected final_loss < 10% of initial, "
-            f"got initial={initial_loss:.4f}, final={final_loss:.6f}"
-        )
-
-    def test_converges_quadratic_no_compression(self):
-        """With both compressions disabled, should match Adam convergence."""
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.randn(50))
-        opt = TurboAdam([x], lr=1e-2, compress_m=False, compress_v=False)
-
-        initial_loss = (x**2).sum().item()
-        for _ in range(200):
-            opt.zero_grad()
-            loss = (x**2).sum()
-            loss.backward()
-            opt.step()
-
-        final_loss = (x**2).sum().item()
-        assert final_loss < 0.10 * initial_loss
-
-
-# ---------------------------------------------------------------------------
-# 3. State structure: compressed v and CoState m
-# ---------------------------------------------------------------------------
-
-
-class TestStateStructure:
-    def test_compressed_v_present_after_first_step(self):
-        """After first step, state should contain compressed_v dict."""
-        torch.manual_seed(0)
-        params = _make_params()
-        opt = TurboAdam(params)
-        _step_with_grad(opt, params)
-
-        for p in params:
-            state = opt.state[p]
-            assert "compressed_v" in state, "compressed_v missing from state"
-            assert isinstance(state["compressed_v"], dict)
-
-    def test_compressed_v_roundtrip_shape(self):
-        """Decompressed v should match parameter shape."""
-        torch.manual_seed(0)
-        params = _make_params()
-        opt = TurboAdam(params)
-        _step_with_grad(opt, params)
-
-        for p in params:
-            v_recon = decompress_v(opt.state[p]["compressed_v"])
-            assert v_recon.shape == p.shape
-
-    def test_compressed_v_updates_each_step(self):
-        """compressed_v should change between steps (v is updated every step)."""
-        torch.manual_seed(0)
-        params = _make_params()
-        opt = TurboAdam(params)
-
-        _step_with_grad(opt, params)
-        v1 = decompress_v(opt.state[params[0]]["compressed_v"]).clone()
-
-        _step_with_grad(opt, params)
-        v2 = decompress_v(opt.state[params[0]]["compressed_v"])
-
-        assert not torch.allclose(v1, v2), "compressed_v should change between steps"
-
-    def test_no_exp_avg_sq_when_compress_v(self):
-        """With compress_v=True, state should NOT contain exp_avg_sq."""
-        torch.manual_seed(0)
-        params = _make_params()
-        opt = TurboAdam(params, compress_v=True)
-        _step_with_grad(opt, params)
-
-        for p in params:
-            assert "exp_avg_sq" not in opt.state[p]
-
-    def test_exp_avg_sq_when_no_compress_v(self):
-        """With compress_v=False, state should have fp32 exp_avg_sq."""
-        torch.manual_seed(0)
-        params = _make_params()
-        opt = TurboAdam(params, compress_v=False)
-        _step_with_grad(opt, params)
-
-        for p in params:
-            state = opt.state[p]
-            assert "exp_avg_sq" in state
-            assert state["exp_avg_sq"].dtype == torch.float32
-            assert "compressed_v" not in state
-
-    def test_m_mgr_present_for_large_params(self):
-        """m compression manager should be in state for large params when compress_m=True."""
-        torch.manual_seed(0)
-        params = [nn.Parameter(torch.randn(64, 64))]  # 4096 elements
-        opt = TurboAdam(params, compress_m=True)
-        _step_with_grad(opt, params)
-
-        assert "m_mgr" in opt.state[params[0]]
-
-    def test_small_params_skip_costate(self):
-        """Small params (< 4096 elements) should use fp32 m even with compress_m=True."""
-        torch.manual_seed(0)
-        params = [nn.Parameter(torch.randn(20))]
-        opt = TurboAdam(params, compress_m=True)
-        _step_with_grad(opt, params)
-
-        assert "exp_avg" in opt.state[params[0]]
-        assert "costate_mgr" not in opt.state[params[0]]
-
-    def test_exp_avg_when_no_compress_m(self):
-        """With compress_m=False, state should have fp32 exp_avg."""
-        torch.manual_seed(0)
-        params = _make_params()
-        opt = TurboAdam(params, compress_m=False)
-        _step_with_grad(opt, params)
-
-        for p in params:
-            state = opt.state[p]
-            assert "exp_avg" in state
-            assert state["exp_avg"].dtype == torch.float32
-            assert "costate_mgr" not in state
-
-    def test_step_counter_increments(self):
-        """State step counter should increment correctly."""
-        torch.manual_seed(0)
-        params = _make_params()
-        opt = TurboAdam(params)
-        for step_num in range(1, 6):
-            _step_with_grad(opt, params)
-            for p in params:
-                assert opt.state[p]["step"] == step_num
-
-    @pytest.mark.skipif(
-        not torch.cuda.is_available(), reason="CUDA required"
+def _run_uncompressed_pair(
+    gradients: list[torch.Tensor | None],
+    *,
+    betas: tuple[float, float] = (0.9, 0.999),
+    weight_decay: float = 0.01,
+) -> tuple[torch.Tensor, torch.Tensor, TurboAdam, torch.optim.AdamW]:
+    initial = torch.randn(257, generator=torch.Generator().manual_seed(17))
+    reference = torch.nn.Parameter(initial.clone())
+    candidate = torch.nn.Parameter(initial.clone())
+    adamw = torch.optim.AdamW(
+        [reference],
+        lr=3.0e-4,
+        betas=betas,
+        eps=1.0e-8,
+        weight_decay=weight_decay,
     )
-    def test_cuda_state_has_no_random_buffer(self):
-        """compressed_v must carry only indices, scales, and metadata on CUDA.
+    turbo = TurboAdam(
+        [candidate],
+        lr=3.0e-4,
+        betas=betas,
+        eps=1.0e-8,
+        weight_decay=weight_decay,
+        compress_m=False,
+        compress_v=False,
+    )
+    for gradient in gradients:
+        reference.grad = None if gradient is None else gradient.clone()
+        candidate.grad = None if gradient is None else gradient.clone()
+        adamw.step()
+        turbo.step()
+    return reference, candidate, turbo, adamw
 
-        Stochastic-rounding randomness is hashed in-kernel from a per-step seed,
-        so no per-parameter fp32 random buffer is stored in optimizer state.
-        """
-        torch.manual_seed(0)
-        p = nn.Parameter(torch.randn(64, 64, device="cuda"))
-        opt = TurboAdam([p], lr=1e-2, v_bits=4)
-        opt.zero_grad()
-        (p ** 2).sum().backward()
-        opt.step()
-        cv = opt.state[p]["compressed_v"]
-        assert "rand_buf" not in cv, (
-            "compressed_v must not store a persistent fp32 random buffer"
+
+def test_uncompressed_fp32_path_is_bit_exact_to_adamw() -> None:
+    generator = torch.Generator().manual_seed(30)
+    gradients = [torch.randn(257, generator=generator) for _ in range(30)]
+    reference, candidate, turbo, adamw = _run_uncompressed_pair(gradients)
+    assert torch.equal(reference, candidate)
+    assert torch.equal(
+        adamw.state[reference]["exp_avg"], turbo.state[candidate]["exp_avg"]
+    )
+    assert torch.equal(
+        adamw.state[reference]["exp_avg_sq"], turbo.state[candidate]["exp_avg_sq"]
+    )
+
+
+def test_per_parameter_steps_match_intermittent_gradients() -> None:
+    torch.manual_seed(2)
+    references = [
+        torch.nn.Parameter(torch.randn(17)),
+        torch.nn.Parameter(torch.randn(17)),
+    ]
+    candidates = [torch.nn.Parameter(value.detach().clone()) for value in references]
+    adamw = torch.optim.AdamW(references, lr=1.0e-3, weight_decay=0.01)
+    turbo = TurboAdam(
+        candidates,
+        lr=1.0e-3,
+        weight_decay=0.01,
+        compress_m=False,
+        compress_v=False,
+    )
+    schedule = [(True, False), (True, True), (False, True), (True, True)]
+    for step, active in enumerate(schedule):
+        for index, is_active in enumerate(active):
+            gradient = torch.full((17,), float(step + index + 1)) if is_active else None
+            references[index].grad = None if gradient is None else gradient.clone()
+            candidates[index].grad = None if gradient is None else gradient.clone()
+        adamw.step()
+        turbo.step()
+    for reference, candidate in zip(references, candidates, strict=True):
+        assert torch.equal(reference, candidate)
+    assert turbo.state[candidates[0]]["step"] == 3
+    assert turbo.state[candidates[1]]["step"] == 3
+
+
+def test_default_large_tensor_has_6_500732_bits_per_value() -> None:
+    numel = 131_072
+    parameter = torch.nn.Parameter(torch.zeros(numel))
+    optimizer = TurboAdam([parameter], rounding_seed=5)
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    state = optimizer.state[parameter]
+    assert set(state) == {"step", "_use_ustate", "ustate", "_use_v_state", "v_state"}
+    bytes_used = state_tensor_bytes(state)
+    assert bytes_used == 106_508
+    bits_per_value = bytes_used * 8 / numel
+    assert bits_per_value == pytest.approx(6.500732421875)
+    assert 64.0 / bits_per_value == pytest.approx(9.845044503699253, rel=1.0e-12)
+
+
+def test_compact_state_contains_no_full_size_fp32_tensor() -> None:
+    parameter = torch.nn.Parameter(torch.randn(32_768))
+    optimizer = TurboAdam([parameter])
+    parameter.grad = torch.randn_like(parameter)
+    optimizer.step()
+    state = optimizer.state[parameter]
+    tensors = [
+        value
+        for family in (state["ustate"], state["v_state"])
+        for value in family.values()
+        if isinstance(value, torch.Tensor)
+    ]
+    assert not any(
+        tensor.dtype == torch.float32 and tensor.numel() == parameter.numel()
+        for tensor in tensors
+    )
+    assert not any("rand" in key or "error" in key for key in state)
+
+
+def test_small_parameters_use_exact_states_by_default() -> None:
+    parameter = torch.nn.Parameter(torch.randn(1024))
+    optimizer = TurboAdam([parameter])
+    parameter.grad = torch.randn_like(parameter)
+    optimizer.step()
+    state = optimizer.state[parameter]
+    assert state["_use_ustate"] is False
+    assert state["_use_v_state"] is False
+    assert state["exp_avg"].dtype == torch.float32
+    assert state["exp_avg_sq"].dtype == torch.float32
+
+
+def test_thresholds_can_force_compression_for_small_tensors() -> None:
+    parameter = torch.nn.Parameter(torch.randn(129))
+    optimizer = TurboAdam(
+        [parameter], min_m_compress_elements=0, min_v_compress_elements=0
+    )
+    parameter.grad = torch.randn_like(parameter)
+    optimizer.step()
+    state = optimizer.state[parameter]
+    assert state["_use_ustate"] is True
+    assert state["_use_v_state"] is True
+    assert state["ustate"]["codes"].numel() == 64
+
+
+@pytest.mark.parametrize(
+    ("compress_m", "compress_v"),
+    [(True, False), (False, True), (False, False), (True, True)],
+)
+def test_state_ablation_combinations_are_finite(
+    compress_m: bool, compress_v: bool
+) -> None:
+    parameter = torch.nn.Parameter(torch.randn(8192))
+    optimizer = TurboAdam(
+        [parameter],
+        compress_m=compress_m,
+        compress_v=compress_v,
+        rounding_seed=11,
+    )
+    for _ in range(4):
+        parameter.grad = torch.randn_like(parameter)
+        optimizer.step()
+    assert bool(torch.isfinite(parameter).all())
+
+
+def test_checkpoint_roundtrip_continues_exactly() -> None:
+    generator = torch.Generator().manual_seed(44)
+    gradients = [torch.randn(8193, generator=generator) for _ in range(9)]
+    original_parameter = torch.nn.Parameter(torch.randn(8193, generator=generator))
+    original_optimizer = TurboAdam([original_parameter], lr=1.0e-3, rounding_seed=123)
+    for gradient in gradients[:5]:
+        original_parameter.grad = gradient
+        original_optimizer.step()
+    saved_parameter = original_parameter.detach().clone()
+    saved_state = copy.deepcopy(original_optimizer.state_dict())
+
+    buffer = io.BytesIO()
+    torch.save(saved_state, buffer)
+    buffer.seek(0)
+    loaded_state = torch.load(buffer, weights_only=True)
+
+    for gradient in gradients[5:]:
+        original_parameter.grad = gradient
+        original_optimizer.step()
+
+    resumed_parameter = torch.nn.Parameter(saved_parameter)
+    resumed_optimizer = TurboAdam([resumed_parameter], lr=9.0e-9, rounding_seed=999)
+    resumed_optimizer.load_state_dict(loaded_state)
+    for gradient in gradients[5:]:
+        resumed_parameter.grad = gradient
+        resumed_optimizer.step()
+
+    assert torch.equal(original_parameter, resumed_parameter)
+    original_state = original_optimizer.state[original_parameter]
+    resumed_state = resumed_optimizer.state[resumed_parameter]
+    for family in ("ustate", "v_state"):
+        for key, value in original_state[family].items():
+            if isinstance(value, torch.Tensor):
+                assert torch.equal(value, resumed_state[family][key])
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_low_precision_checkpoint_preserves_codec_bits(dtype: torch.dtype) -> None:
+    parameter = torch.nn.Parameter(torch.randn(8193, dtype=dtype))
+    optimizer = TurboAdam([parameter], rounding_seed=77)
+    for _ in range(3):
+        parameter.grad = torch.randn_like(parameter)
+        optimizer.step()
+    saved = copy.deepcopy(optimizer.state_dict())
+    loaded_parameter = torch.nn.Parameter(parameter.detach().clone())
+    loaded_optimizer = TurboAdam([loaded_parameter], rounding_seed=1)
+    loaded_optimizer.load_state_dict(saved)
+    original = optimizer.state[parameter]
+    loaded = loaded_optimizer.state[loaded_parameter]
+    assert torch.equal(original["ustate"]["codes"], loaded["ustate"]["codes"])
+    assert torch.equal(original["ustate"]["means"], loaded["ustate"]["means"])
+    assert torch.equal(original["v_state"]["indices"], loaded["v_state"]["indices"])
+    assert torch.equal(original["v_state"]["scales"], loaded["v_state"]["scales"])
+
+
+def test_checkpoint_rejects_noncurrent_state_schema() -> None:
+    parameter = torch.nn.Parameter(torch.randn(8193))
+    optimizer = TurboAdam([parameter])
+    parameter.grad = torch.randn_like(parameter)
+    optimizer.step()
+    saved = copy.deepcopy(optimizer.state_dict())
+    parameter_id = saved["param_groups"][0]["params"][0]
+    saved["state"][parameter_id]["extra"] = True
+    loaded = TurboAdam([torch.nn.Parameter(parameter.detach().clone())])
+    with pytest.raises(ValueError, match="unexpected"):
+        loaded.load_state_dict(saved)
+
+
+def test_add_param_group_validates_and_steps_new_parameter() -> None:
+    first = torch.nn.Parameter(torch.randn(10))
+    second = torch.nn.Parameter(torch.randn(10))
+    optimizer = TurboAdam([first], compress_m=False, compress_v=False)
+    optimizer.add_param_group({"params": [second]})
+    first.grad = torch.ones_like(first)
+    second.grad = torch.ones_like(second)
+    optimizer.step()
+    assert optimizer.state[first]["step"] == 1
+    assert optimizer.state[second]["step"] == 1
+    with pytest.raises(ValueError, match="divisible"):
+        optimizer.add_param_group(
+            {
+                "params": [torch.nn.Parameter(torch.ones(2))],
+                "block_size": 96,
+                "m_block_size": 64,
+            }
         )
-        tensor_values = [v for v in cv.values() if torch.is_tensor(v)]
-        bytes_per_param = (
-            sum(t.element_size() * t.numel() for t in tensor_values) / p.numel()
+
+
+def test_noncontiguous_parameter_uses_reference_path() -> None:
+    parameter = torch.nn.Parameter(torch.randn(128, 64).t())
+    assert not parameter.is_contiguous()
+    optimizer = TurboAdam(
+        [parameter], min_m_compress_elements=0, min_v_compress_elements=0
+    )
+    for _ in range(4):
+        parameter.grad = torch.randn_like(parameter)
+        optimizer.step()
+    assert bool(torch.isfinite(parameter).all())
+
+
+def test_closure_empty_and_error_paths() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    optimizer = TurboAdam([parameter], compress_m=False, compress_v=False)
+    called = []
+
+    def closure() -> torch.Tensor:
+        called.append(True)
+        return parameter.square().sum()
+
+    parameter.grad = torch.tensor([1.0])
+    loss = optimizer.step(closure)
+    assert called and loss.item() > 0
+
+    empty = torch.nn.Parameter(torch.empty(0))
+    empty_optimizer = TurboAdam([empty])
+    empty.grad = torch.empty(0)
+    empty_optimizer.step()
+    assert empty not in empty_optimizer.state or not empty_optimizer.state[empty]
+
+    sparse = torch.nn.Parameter(torch.ones(4))
+    sparse_optimizer = TurboAdam([sparse])
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Sparse invariant checks.*")
+        sparse.grad = torch.sparse_coo_tensor(
+            torch.tensor([[0]]),
+            torch.tensor([1.0]),
+            (4,),
+            is_coalesced=True,
+            check_invariants=True,
         )
-        # v_bits=4 yields ~4.25 bits/param (4-bit indices + 2 fp16 scales per
-        # 128-elem block); the persistent random buffer would have added 32.
-        assert bytes_per_param * 8 < 16, (
-            f"v state exceeds 16 bits/param ({bytes_per_param * 8:.2f}); "
-            "a stray fp32 buffer may be present"
-        )
-
-
-# ---------------------------------------------------------------------------
-# 4. Closeness to standard Adam
-# ---------------------------------------------------------------------------
-
-
-class TestAdamComparison:
-    def _run_optimizer(self, opt_class, params, grads_sequence, opt_kwargs=None):
-        """Run optimizer for len(grads_sequence) steps, return final param values."""
-        if opt_kwargs is None:
-            opt_kwargs = {}
-        opt = opt_class(params, lr=1e-3, **opt_kwargs)
-        for grads in grads_sequence:
-            for p, g in zip(params, grads):
-                p.grad = g.clone()
-            opt.step()
-        return [p.data.clone() for p in params]
-
-    def test_no_compression_matches_adam(self):
-        """With both compressions disabled, TurboAdam should match Adam exactly."""
-        torch.manual_seed(7)
-        n_steps = 10
-
-        grad_sequence = []
-        for _ in range(n_steps):
-            grads = [torch.randn(10, 10), torch.randn(20)]
-            grad_sequence.append(grads)
-
-        torch.manual_seed(42)
-        adam_params = [nn.Parameter(torch.ones(10, 10)), nn.Parameter(torch.ones(20))]
-        adam_results = self._run_optimizer(
-            torch.optim.Adam,
-            adam_params,
-            grad_sequence,
-            opt_kwargs={"betas": (0.9, 0.999)},
-        )
-
-        torch.manual_seed(42)
-        turbo_params = [nn.Parameter(torch.ones(10, 10)), nn.Parameter(torch.ones(20))]
-        turbo_results = self._run_optimizer(
-            TurboAdam,
-            turbo_params,
-            grad_sequence,
-            opt_kwargs={
-                "betas": (0.9, 0.999),
-                "compress_m": False,
-                "compress_v": False,
-            },
-        )
-
-        for i, (a_val, t_val) in enumerate(zip(adam_results, turbo_results)):
-            assert torch.allclose(a_val, t_val, atol=1e-6), (
-                f"Param {i}: TurboAdam(no compression) should exactly match Adam"
-            )
-
-    def test_close_to_adam_10_steps(self):
-        """TurboAdam with compression should be within ~15% of Adam after 10 steps."""
-        torch.manual_seed(7)
-        n_steps = 10
-
-        grad_sequence = []
-        for _ in range(n_steps):
-            grads = [torch.randn(10, 10), torch.randn(20)]
-            grad_sequence.append(grads)
-
-        torch.manual_seed(42)
-        adam_params = [nn.Parameter(torch.ones(10, 10)), nn.Parameter(torch.ones(20))]
-        adam_results = self._run_optimizer(
-            torch.optim.Adam,
-            adam_params,
-            grad_sequence,
-            opt_kwargs={"betas": (0.9, 0.999)},
-        )
-
-        torch.manual_seed(42)
-        turbo_params = [nn.Parameter(torch.ones(10, 10)), nn.Parameter(torch.ones(20))]
-        turbo_results = self._run_optimizer(
-            TurboAdam, turbo_params, grad_sequence, opt_kwargs={"betas": (0.9, 0.999)}
-        )
-
-        for i, (a_val, t_val) in enumerate(zip(adam_results, turbo_results)):
-            a_norm = a_val.norm().item()
-            diff_norm = (a_val - t_val).norm().item()
-            rel_error = diff_norm / (a_norm + 1e-8)
-            assert rel_error < 0.15, (
-                f"Param {i}: relative error {rel_error:.4f} exceeds 15% tolerance"
-            )
-
-    def test_param_values_change_after_step(self):
-        """Parameters should actually be updated after optimizer step."""
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.ones(10))
-        initial = x.data.clone()
-        opt = TurboAdam([x], lr=1e-2)
-        x.grad = torch.ones(10)
-        opt.step()
-        assert not torch.allclose(x.data, initial), (
-            "Parameters did not change after step"
-        )
-
-
-# ---------------------------------------------------------------------------
-# 5. Weight decay
-# ---------------------------------------------------------------------------
-
-
-class TestWeightDecay:
-    def test_weight_decay_reduces_params(self):
-        """With weight_decay, parameters should be pulled toward zero."""
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.ones(20) * 10.0)
-        opt = TurboAdam([x], lr=1e-3, weight_decay=0.1)
-        for _ in range(10):
-            x.grad = torch.zeros(20)
-            opt.step()
-        assert x.data.abs().mean().item() < 10.0, "Weight decay did not reduce params"
-
-
-# ---------------------------------------------------------------------------
-# 6. Multiple param groups
-# ---------------------------------------------------------------------------
-
-
-class TestParamGroups:
-    def test_multiple_param_groups(self):
-        """Optimizer should handle multiple param groups correctly."""
-        torch.manual_seed(0)
-        p1 = nn.Parameter(torch.randn(5, 5))
-        p2 = nn.Parameter(torch.randn(10))
-        opt = TurboAdam(
-            [
-                {"params": [p1], "lr": 1e-2},
-                {"params": [p2], "lr": 1e-4},
-            ]
-        )
-        p1.grad = torch.randn_like(p1)
-        p2.grad = torch.randn_like(p2)
-        opt.step()
-        assert p1 in opt.state
-        assert p2 in opt.state
-
-
-# ---------------------------------------------------------------------------
-# 7. V compression quality
-# ---------------------------------------------------------------------------
-
-
-class TestVCompression:
-    def test_compressed_v_nonnegative(self):
-        """Decompressed v should be non-negative (EMA of squared gradients)."""
-        torch.manual_seed(0)
-        params = _make_params()
-        opt = TurboAdam(params)
-        for _ in range(10):
-            _step_with_grad(opt, params)
-
-        for p in params:
-            v = decompress_v(opt.state[p]["compressed_v"])
-            assert (v >= 0).all(), "Decompressed v contains negative values"
-
-    def test_v_bits_parameter(self):
-        """Different v_bits values should work."""
-        for bits in [2, 3, 4, 6, 8]:
-            torch.manual_seed(0)
-            params = _make_params()
-            opt = TurboAdam(params, v_bits=bits)
-            _step_with_grad(opt, params)
-            v = decompress_v(opt.state[params[0]]["compressed_v"])
-            assert v.shape == params[0].shape
-
-    def test_v_bits_invalid_rejected(self):
-        """Invalid v_bits values should raise ValueError."""
-        params = _make_params()
-        with pytest.raises(ValueError, match="v_bits must be one of"):
-            TurboAdam(params, v_bits=10)
-        with pytest.raises(ValueError, match="v_bits must be one of"):
-            TurboAdam(params, v_bits=16)
-
-    def test_convergence_at_various_bits(self):
-        """Should converge on quadratic at 4, 6, and 8 bits (within 500 steps)."""
-        for bits in [4, 6, 8]:
-            torch.manual_seed(0)
-            x = nn.Parameter(torch.randn(50))
-            opt = TurboAdam([x], lr=1e-2, v_bits=bits)
-
-            initial_loss = (x**2).sum().item()
-            for _ in range(500):
-                opt.zero_grad()
-                loss = (x**2).sum()
-                loss.backward()
-                opt.step()
-
-            final_loss = (x**2).sum().item()
-            assert final_loss < 0.10 * initial_loss, (
-                f"Failed to converge at {bits}-bit: "
-                f"initial={initial_loss:.4f}, final={final_loss:.6f}"
-            )
-
-
-# ---------------------------------------------------------------------------
-# 8. Ablation flags
-# ---------------------------------------------------------------------------
-
-
-class TestAblationFlags:
-    def test_compress_m_only(self):
-        """compress_m=True, compress_v=False should work (CoState only)."""
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.randn(50))
-        opt = TurboAdam([x], lr=1e-2, compress_m=True, compress_v=False)
-
-        initial_loss = (x**2).sum().item()
-        for _ in range(200):
-            opt.zero_grad()
-            loss = (x**2).sum()
-            loss.backward()
-            opt.step()
-
-        final_loss = (x**2).sum().item()
-        assert final_loss < 0.10 * initial_loss
-
-    def test_compress_v_only(self):
-        """compress_m=False, compress_v=True should work (v compression only)."""
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.randn(50))
-        opt = TurboAdam([x], lr=1e-2, compress_m=False, compress_v=True)
-
-        initial_loss = (x**2).sum().item()
-        for _ in range(200):
-            opt.zero_grad()
-            loss = (x**2).sum()
-            loss.backward()
-            opt.step()
-
-        final_loss = (x**2).sum().item()
-        assert final_loss < 0.10 * initial_loss
-
-    def test_no_compression(self):
-        """Both disabled should behave like standard Adam."""
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.randn(50))
-        opt = TurboAdam([x], lr=1e-2, compress_m=False, compress_v=False)
-
-        initial_loss = (x**2).sum().item()
-        for _ in range(200):
-            opt.zero_grad()
-            loss = (x**2).sum()
-            loss.backward()
-            opt.step()
-
-        final_loss = (x**2).sum().item()
-        assert final_loss < 0.10 * initial_loss
-
-
-# ---------------------------------------------------------------------------
-# 9. Closure support
-# ---------------------------------------------------------------------------
-
-
-class TestClosure:
-    def test_closure_returns_loss(self):
-        """step(closure) should return the loss value."""
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.randn(10))
-        opt = TurboAdam([x], lr=1e-2)
-
-        def closure():
-            opt.zero_grad()
-            loss = (x**2).sum()
-            loss.backward()
-            return loss
-
-        loss = opt.step(closure)
-        assert loss is not None
-        assert loss.item() > 0
-
-
-# ---------------------------------------------------------------------------
-# 10. State dict roundtrip
-# ---------------------------------------------------------------------------
-
-
-class TestStateDict:
-    def test_state_dict_roundtrip_matches_continuous(self):
-        """Save → load → step should match continuous run."""
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.randn(10, 10))
-        y = nn.Parameter(torch.randn(10, 10))
-        opt = TurboAdam([x, y], lr=1e-2, v_bits=4)
-
-        # Run 5 steps
-        for _ in range(5):
-            opt.zero_grad()
-            loss = (x**2 + y**2).sum()
-            loss.backward()
-            opt.step()
-
-        # Save state
-        state = opt.state_dict()
-
-        # Create fresh optimizer with same params
-        x2 = nn.Parameter(x.data.clone())
-        y2 = nn.Parameter(y.data.clone())
-        opt2 = TurboAdam([x2, y2], lr=1e-2, v_bits=4)
-        opt2.load_state_dict(state)
-
-        # Run 3 more steps on both
-        for _ in range(3):
-            opt.zero_grad()
-            loss = (x**2 + y**2).sum()
-            loss.backward()
-            opt.step()
-
-            opt2.zero_grad()
-            loss2 = (x2**2 + y2**2).sum()
-            loss2.backward()
-            opt2.step()
-
-        # Tolerances relaxed because stochastic rounding's random state
-        # is not captured in state_dict (the per-step seed is not serialized).
-        # The key assertion is that load+step does not crash and stays stable.
-        assert torch.allclose(x.data, x2.data, atol=0.1)
-        assert torch.allclose(y.data, y2.data, atol=0.1)
-
-    def test_state_dict_device_migration(self):
-        """Save on CPU, load on CPU (different device context)."""
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.randn(10, 10))
-        opt = TurboAdam([x], lr=1e-2)
-
-        opt.zero_grad()
-        (x**2).sum().backward()
-        opt.step()
-
-        state = opt.state_dict()
-
-        # Load into fresh optimizer
-        x2 = nn.Parameter(x.data.clone())
-        opt2 = TurboAdam([x2], lr=1e-2)
-        opt2.load_state_dict(state)
-
-        # Should be able to step without device errors
-        opt2.zero_grad()
-        (x2**2).sum().backward()
-        opt2.step()
-
-    def test_load_state_dict_migrates_costate_manager_tensors(self):
-        """load_state_dict must move CoStateManager internal tensors to param device.
-
-        CoStateManager persists _alpha, _encoded tensors, and an optional
-        _ef_residual. After load_state_dict, all must sit on the parameter's
-        device or downstream kernels fail with a device mismatch. Exercises the
-        error_feedback=True path that populates _ef_residual too.
-        """
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.randn(64, 64))  # large enough to use CoState
-        opt = TurboAdam([x], lr=1e-2, error_feedback=True)
-        for _ in range(3):
-            opt.zero_grad()
-            (x**2).sum().backward()
-            opt.step()
-        state = opt.state_dict()
-
-        mgr = opt.state[x]["m_mgr"]
-        assert mgr._encoded is not None
-        assert mgr._ef_residual is not None
-
-        x2 = nn.Parameter(x.data.clone())
-        opt2 = TurboAdam([x2], lr=1e-2, error_feedback=True)
-        opt2.load_state_dict(state)
-        mgr2 = opt2.state[x2]["m_mgr"]
-        assert isinstance(mgr2._alpha, torch.Tensor)
-        expected_device = x2.device
-        assert mgr2._alpha.device == expected_device
-        # Compact CoState state has only sign_packed and block_norms; labels
-        # are encoded in the sign of block_norms and scales are derived on decode.
-        for key in mgr2._encoded:
-            assert mgr2._encoded[key].device == expected_device, (
-                f"{key} not migrated to {expected_device}"
-            )
-        assert mgr2._ef_residual.device == expected_device
-        opt2.zero_grad()
-        (x2**2).sum().backward()
-        opt2.step()
-
-
-# ---------------------------------------------------------------------------
-# 11. Mixed precision
-# ---------------------------------------------------------------------------
-
-
-class TestMixedPrecision:
-    def test_fp16_gradients(self):
-        """CoState should handle fp16 gradients without dtype mismatch."""
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.randn(10, 10).half().cuda())
-        opt = TurboAdam([x], lr=1e-2, v_bits=4)
-
-        opt.zero_grad()
-        (x**2).sum().backward()
-        opt.step()
-
-        assert not torch.isnan(x).any()
-
-    def test_autocast_fp16(self):
-        """Should work inside torch.autocast context."""
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required for autocast test")
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.randn(10, 10).cuda())
-        opt = TurboAdam([x], lr=1e-2, v_bits=4)
-
-        opt.zero_grad()
-        with torch.autocast("cuda"):
-            loss = (x**2).sum()
-        loss.backward()
-        opt.step()
-
-        assert not torch.isnan(x).any()
-
-
-# ---------------------------------------------------------------------------
-# 12. Gradient accumulation
-# ---------------------------------------------------------------------------
-
-
-class TestGradientAccumulation:
-    def test_step_increments_once_per_accumulation(self):
-        """step() should increment step counter once after multiple backward()."""
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.randn(10, 10))
-        opt = TurboAdam([x], lr=1e-2)
-
-        # Trigger lazy init with one step first
-        opt.zero_grad()
-        (x**2).sum().backward()
-        opt.step()
-        assert opt.state[x]["step"] == 1
-
-        # 3 backward calls without step
-        for _ in range(3):
-            opt.zero_grad(set_to_none=False)
-            (x**2).sum().backward()
-
-        # Step counter should still be 1 before next step
-        assert opt.state[x]["step"] == 1
-
-        opt.step()
-
-        # Step counter should be 2 after single step
-        assert opt.state[x]["step"] == 2
-
-    def test_weight_decay_applies_once(self):
-        """Weight decay should apply once per step, not per backward."""
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.ones(10, 10))
-        opt = TurboAdam([x], lr=1e-2, weight_decay=0.1)
-
-        # Run with accumulation (zero gradients so only weight decay affects x)
-        for _ in range(3):
-            opt.zero_grad()
-            # Create explicit zero gradient
-            x.grad = torch.zeros_like(x)
-        opt.step()
-
-        # Weight decay: x = x * (1 - lr * wd) = 1 * (1 - 0.001) = 0.999
-        expected = 1.0 * (1.0 - 1e-2 * 0.1)
-        assert abs(x.data.mean().item() - expected) < 0.0001
-
-
-# ---------------------------------------------------------------------------
-# 13. add_param_group
-# ---------------------------------------------------------------------------
-
-
-class TestAddParamGroup:
-    def test_add_param_group_does_not_break_bias_correction(self):
-        """Adding a new parameter group mid-training should work."""
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.randn(10, 10))
-        y = nn.Parameter(torch.randn(10, 10))
-        opt = TurboAdam([x], lr=1e-2)
-
-        # Step a few times
-        for _ in range(5):
-            opt.zero_grad()
-            (x**2).sum().backward()
-            opt.step()
-
-        # Add new parameter group
-        opt.add_param_group({"params": [y], "lr": 1e-3})
-
-        # Step with both parameters
-        opt.zero_grad()
-        (x**2 + y**2).sum().backward()
-        opt.step()
-
-        # Both should have stepped without error
-        assert opt.state[x]["step"] == 6
-        assert opt.state[y]["step"] == 1
-
-    def test_add_param_group_new_param_gets_correct_lr(self):
-        """New param group should use its own LR."""
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.ones(10, 10))
-        y = nn.Parameter(torch.ones(10, 10))
-        opt = TurboAdam([x], lr=1e-2)
-        opt.add_param_group({"params": [y], "lr": 1e-1})
-
-        opt.zero_grad()
-        (x + y).sum().backward()
-        opt.step()
-
-        # x with lr=1e-2 should change less than y with lr=1e-1
-        assert x.data.mean() != 1.0
-        assert y.data.mean() != 1.0
-
-
-# ---------------------------------------------------------------------------
-# 14. Constructor validation
-# ---------------------------------------------------------------------------
-
-
-class TestConstructorValidation:
-    def test_capturable_true_raises(self):
-        """capturable=True should raise NotImplementedError."""
-        with pytest.raises(NotImplementedError, match="CUDA graph capture"):
-            TurboAdam([nn.Parameter(torch.randn(10))], capturable=True)
-
-    def test_min_m_compress_elements_respected(self):
-        """Params below min_m_compress_elements should skip CoState."""
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.randn(100))  # 100 elements
-        opt = TurboAdam([x], min_m_compress_elements=200)
-        opt.zero_grad()
-        (x**2).sum().backward()
-        opt.step()
-        assert "exp_avg" in opt.state[x]  # fp32 m, not CoState
-        assert "m_mgr" not in opt.state[x]
-
-    def test_min_m_compress_elements_large_param_uses_costate(self):
-        """Params above min_m_compress_elements should use CoState."""
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.randn(5000))  # 5000 elements
-        opt = TurboAdam([x], min_m_compress_elements=100)
-        opt.zero_grad()
-        (x**2).sum().backward()
-        opt.step()
-        assert "m_mgr" in opt.state[x]  # CoState manager
-        assert "exp_avg" not in opt.state[x]
-
-
-# ---------------------------------------------------------------------------
-# 15. Skipped grads, error feedback, and lone biased-time path
-# ---------------------------------------------------------------------------
-
-
-class TestEdgeCases:
-    def test_param_without_grad_is_skipped(self):
-        """When some params have no gradient, step() must skip them cleanly."""
-        torch.manual_seed(0)
-        p1 = nn.Parameter(torch.randn(64, 64))
-        p2 = nn.Parameter(torch.randn(64, 64))
-        opt = TurboAdam([p1, p2], lr=1e-2)
-        opt.zero_grad(set_to_none=True)
-        (p1**2).sum().backward()  # only p1 has grad
-        opt.step()
-        assert opt.state[p1]["step"] == 1
-        assert p2 not in opt.state or opt.state[p2].get("step", 0) == 0
-        assert not torch.allclose(p1.data, p2.data)
-
-    def test_error_feedback_converges_and_accumulates_residual(self):
-        """error_feedback=True must converge and populate _ef_residual.
-
-        Error feedback adds the prior encoding loss back into the next gradient.
-        This certifies the path runs without NaN and the residual buffer is
-        populated (the branch was uncovered).
-        """
-        torch.manual_seed(0)
-        x = nn.Parameter(torch.randn(64, 64))
-        opt = TurboAdam([x], lr=1e-2, error_feedback=True)
-        for _ in range(30):
-            opt.zero_grad()
-            (x**2).sum().backward()
-            opt.step()
-        assert not torch.isnan(x).any()
-        mgr = opt.state[x]["m_mgr"]
-        assert mgr._ef_residual is not None
-        assert mgr._ef_residual.shape == x.shape
+    with pytest.raises(RuntimeError, match="sparse"):
+        sparse_optimizer.step()
+
+
+def test_configuration_validation() -> None:
+    parameter = torch.nn.Parameter(torch.ones(4))
+    with pytest.raises(ValueError, match=r"beta1\*\*2"):
+        TurboAdam([parameter], betas=(0.9, 0.8))
+    with pytest.raises(ValueError, match="divisible"):
+        TurboAdam([parameter], block_size=96, m_block_size=64)
+    with pytest.raises(NotImplementedError, match="capture"):
+        TurboAdam([parameter], capturable=True)
+    with pytest.raises(TypeError):
+        TurboAdam([parameter], error_feedback=True)

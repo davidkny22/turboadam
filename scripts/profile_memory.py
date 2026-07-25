@@ -7,14 +7,16 @@ Usage:
     python scripts/profile_memory.py
 """
 
+import argparse
 import gc
 import json
-import os
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 
 from turboadam import TurboAdam
+from turboadam.utils import state_tensor_bytes
 
 
 def _make_params(device: str = "cuda"):
@@ -49,26 +51,13 @@ def _measure_memory(opt_class, opt_kwargs, params):
     opt.step()
 
     peak = torch.cuda.max_memory_allocated()
-    # The delta from base is dominated by optimizer state + any temporaries
-    # We also measure the persistent state by summing state tensor sizes
-    persistent = 0
-    for state in opt.state.values():
-        for v in state.values():
-            if isinstance(v, torch.Tensor):
-                persistent += v.numel() * v.element_size()
-            elif isinstance(v, dict):
-                for vv in v.values():
-                    if isinstance(vv, torch.Tensor):
-                        persistent += vv.numel() * vv.element_size()
-            elif hasattr(v, "_encoded") and v._encoded is not None:
-                for vv in v._encoded.values():
-                    if isinstance(vv, torch.Tensor):
-                        persistent += vv.numel() * vv.element_size()
-
-    return peak - base, persistent
+    return peak - base, state_tensor_bytes(opt.state)
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output", type=Path, default=None)
+    args = parser.parse_args()
     if not torch.cuda.is_available():
         print("CUDA not available: memory profiling requires GPU.")
         return
@@ -114,12 +103,10 @@ def main():
 
     print("=" * 60)
 
-    # Save results
-    os.makedirs("experiments/results", exist_ok=True)
-    out_path = "experiments/results/memory_profile.json"
-    with open(out_path, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"Results saved to {out_path}")
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
+        print(f"Results saved to {args.output}")
 
 
 if __name__ == "__main__":

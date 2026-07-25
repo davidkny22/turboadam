@@ -1,18 +1,17 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "turboadam"
-version = "0.1.0"
-description = "Drop-in Adam/AdamW replacement with 6.5× optimizer-state memory reduction. One line change, no model modifications. Compresses both moments in-place during training with bounded per-element error guarantees."
+version = "0.2.0"
+description = "AdamW with packed 6.50-bit persistent optimizer state and a fused Triton update path."
 readme = "README.md"
 keywords = ["optimizer", "adam", "adamw", "pytorch", "memory-efficient", "quantization", "deep-learning", "training"]
 authors = [{ name = "David Kogan", email = "davidkny22@gmail.com" }]
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.10"
 classifiers = [
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -22,13 +21,17 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.2.0",
-    "numpy>=1.26.0",
 ]
 
 [project.optional-dependencies]
-triton = ["triton>=2.2.0"]
+triton = [
+    "triton>=2.2.0; sys_platform == 'linux'",
+    "triton-windows>=3.6.0.post26; sys_platform == 'win32'",
+]
 dev = [
     "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.5.0",
     "matplotlib>=3.8.0",
     "datasets>=2.18.0",
     "transformers>=4.40.0",
@@ -44,3 +47,10 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

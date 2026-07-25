@@ -1,7 +1,7 @@
 """Small reproducible CPU benchmark for the optimized TurboAdam package.
 
 This is diagnostic, not a pass/fail test. Run from the package root with:
-    PYTHONPATH=. python benchmarks/benchmark_cpu.py
+    PYTHONPATH=src python benchmarks/benchmark_cpu.py
 """
 
 from __future__ import annotations
@@ -17,8 +17,7 @@ from turboadam import TurboAdam
 def measure(numel: int, compress_m: bool, compress_v: bool, repeats: int = 100):
     p = torch.nn.Parameter(torch.randn(numel))
     opt = TurboAdam(
-        [p], compress_m=compress_m, compress_v=compress_v,
-        min_m_compress_elements=0
+        [p], compress_m=compress_m, compress_v=compress_v, min_m_compress_elements=0
     )
     times = []
     for step in range(repeats + 10):

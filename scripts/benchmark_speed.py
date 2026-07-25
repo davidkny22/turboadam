@@ -1,6 +1,6 @@
 """Speed benchmark: AdamW vs TurboAdam configurations.
 
-Mimics one GPT-2 layer param set (from optimization history):
+Mimics one GPT-2 layer parameter set:
     4x(768,768) + (768,3072) + (3072,768) + 3x(768,)
 
 Reports wall-clock ms/step after warmup.
@@ -9,13 +9,12 @@ Usage:
 """
 
 import gc
-import time
+import statistics
 
 import torch
 import torch.nn as nn
 
 from turboadam import TurboAdam
-
 
 # ---------------------------------------------------------------------------
 # Benchmark param set
@@ -58,15 +57,18 @@ def _benchmark(opt_class, opt_kwargs, params, n_warmup: int = 50, n_measure: int
             p.grad = torch.randn_like(p)
         opt.step()
 
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    for _ in range(n_measure):
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(n_measure)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(n_measure)]
+    for index in range(n_measure):
         for p in params:
             p.grad = torch.randn_like(p)
+        starts[index].record()
         opt.step()
+        ends[index].record()
     torch.cuda.synchronize()
-    elapsed_ms = (time.perf_counter() - t0) / n_measure * 1000
-    return elapsed_ms
+    return statistics.median(
+        start.elapsed_time(end) for start, end in zip(starts, ends, strict=True)
+    )
 
 
 # ---------------------------------------------------------------------------

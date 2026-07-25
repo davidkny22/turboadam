@@ -1,16 +1,4 @@
-"""Log-scale quantization for strictly positive optimizer second moments.
-
-Per block:
-  1. Compute log(v_min) and log(v_max)
-  2. Define a center-coded n-bit grid on that fp32 interval
-  3. Store the two endpoints as fp16
-  4. Pack the n-bit indices densely when requested
-
-Log-scale is used because v is positive and spans orders of magnitude. Adam's
-update rule divides by sqrt(v), so relative resolution at small values matters.
-
-Supports 2, 3, 4, 6, and 8-bit generalized modes plus the legacy 2-bit API.
-"""
+"""Packed log-scale quantization for Adam's positive second moment."""
 
 from __future__ import annotations
 
@@ -18,493 +6,480 @@ import math
 
 import torch
 
-from turboadam.utils import BLOCK_SIZE, packed_num_bytes
+from turboadam.utils import BLOCK_SIZE, ceil_div, pad_to_blocks, validate_block_size
 
-_VALID_BITS = (2, 3, 4, 6, 8)
-_LOG_FLOOR = 1e-38
-_SPAN_FLOOR = 1e-10
+SUPPORTED_N_BITS = (2, 3, 4, 6, 8)
+MIN_POSITIVE = 1.0e-38
+MAX_SAFE_LOG_FP16 = 88.6875
 
-
-def _validate_n_bits(n_bits: int) -> None:
-    if n_bits not in _VALID_BITS:
-        raise ValueError(f"n_bits must be one of {_VALID_BITS}, got {n_bits}")
-
-
-def _infer_packed(
-    indices: torch.Tensor,
-    n_bits: int,
-    num_blocks: int,
-    block_size: int,
-    packed: bool | None,
-) -> bool:
-    if packed is not None:
-        return packed
-    if n_bits == 8:
-        return False  # packed and unpacked are byte-identical at 8 bits
-    unpacked_numel = num_blocks * block_size
-    return indices.numel() != unpacked_numel
+_V_STATE_KEYS = {
+    "indices",
+    "scales",
+    "n_bits",
+    "original_shape",
+    "original_length",
+    "block_size",
+}
 
 
-# ---------------------------------------------------------------------------
-# Dense n-bit packing
-# ---------------------------------------------------------------------------
-
-
-def pack_nbit_indices(
-    indices: torch.Tensor,
-    n_bits: int,
-    out: torch.Tensor | None = None,
+def counter_uniform(
+    num_values: int,
+    seed: int,
+    *,
+    device: torch.device,
+    antithetic_pairs: bool = True,
 ) -> torch.Tensor:
-    """Losslessly pack uint8 bucket indices into a dense little-endian stream.
+    """Generate reproducible counter-based fp32 values in [0, 1)."""
+    if num_values < 0:
+        raise ValueError(f"num_values must be non-negative, got {num_values}")
+    if num_values == 0:
+        return torch.empty(0, dtype=torch.float32, device=device)
 
-    ``out`` may be the old packed optimizer-state buffer after it has been
-    decoded, allowing each step to rewrite that storage in place.
-    """
-    _validate_n_bits(n_bits)
-    x = indices.reshape(-1).to(torch.uint8)
-    n = x.numel()
-    expected = packed_num_bytes(n, n_bits)
-    if expected * 8 != n * n_bits:
-        raise ValueError("index count must produce a whole number of packed bytes")
+    key_count = ceil_div(num_values, 2) if antithetic_pairs else num_values
+    keys = torch.arange(key_count, dtype=torch.int64, device=device)
+    values = (keys ^ (int(seed) & 0xFFFFFFFF)) & 0xFFFFFFFF
+    values = ((values ^ (values >> 16)) * 0x7FEB352D) & 0xFFFFFFFF
+    values = ((values ^ (values >> 15)) * 0x846CA68B) & 0xFFFFFFFF
+    values = (values ^ (values >> 16)) & 0xFFFFFFFF
+    base = ((values >> 8) & 0xFFFFFF).to(torch.float32) * 2.0**-24
+    if not antithetic_pairs:
+        return base
 
-    if out is not None:
-        if (
-            out.dtype != torch.uint8
-            or out.device != x.device
-            or out.numel() != expected
-        ):
-            raise ValueError(
-                "packed output buffer has incompatible shape, dtype, or device"
-            )
-        packed = out.reshape(-1)
-    elif n_bits == 8:
-        # At 8 bits, the unpacked uint8 representation is already densely packed.
-        return x.contiguous()
-    else:
-        packed = torch.empty(expected, dtype=torch.uint8, device=x.device)
+    uniform = torch.empty(num_values, dtype=torch.float32, device=device)
+    uniform[0::2] = base
+    uniform[1::2] = (1.0 - base[: num_values // 2]).clamp_max(1.0 - 2.0**-24)
+    return uniform
 
-    if n == 0:
-        return packed
+
+def packed_index_numel(num_values: int, n_bits: int) -> int:
+    """Return the bytes required for a packed n-bit index stream."""
+    if num_values < 0:
+        raise ValueError(f"num_values must be non-negative, got {num_values}")
+    if n_bits not in SUPPORTED_N_BITS:
+        raise ValueError(f"n_bits must be one of {SUPPORTED_N_BITS}, got {n_bits}")
+    return ceil_div(num_values * n_bits, 8)
+
+
+def pack_nbit_indices(indices: torch.Tensor, n_bits: int) -> torch.Tensor:
+    """Pack uint8 indices into a little-endian n-bit stream."""
+    if n_bits not in SUPPORTED_N_BITS:
+        raise ValueError(f"n_bits must be one of {SUPPORTED_N_BITS}, got {n_bits}")
+    flat = indices.reshape(-1).to(torch.uint8)
+    original_numel = flat.numel()
     if n_bits == 8:
-        packed.copy_(x)
-        return packed
+        return flat.contiguous()
 
-    if n_bits == 4:
-        g = x.reshape(-1, 2)
-        packed.copy_(g[:, 0])
-        packed.bitwise_or_(g[:, 1] << 4)
-        return packed
+    group_size = {2: 4, 3: 8, 4: 2, 6: 4}[n_bits]
+    remainder = flat.numel() % group_size
+    if remainder:
+        padded = flat.new_zeros(flat.numel() + group_size - remainder)
+        padded[: flat.numel()].copy_(flat)
+        flat = padded
+    values = flat.to(torch.int32)
 
     if n_bits == 2:
-        g = x.reshape(-1, 4)
-        packed.copy_(g[:, 0])
-        packed.bitwise_or_(g[:, 1] << 2)
-        packed.bitwise_or_(g[:, 2] << 4)
-        packed.bitwise_or_(g[:, 3] << 6)
-        return packed
-
-    if n_bits == 3:
-        g = x.reshape(-1, 8)
-        dest = packed.reshape(-1, 3)
-        dest[:, 0] = g[:, 0] | (g[:, 1] << 3) | ((g[:, 2] & 0x03) << 6)
-        dest[:, 1] = (
-            (g[:, 2] >> 2)
-            | (g[:, 3] << 1)
-            | (g[:, 4] << 4)
-            | ((g[:, 5] & 0x01) << 7)
+        groups = values.reshape(-1, 4)
+        packed = (
+            groups[:, 0]
+            | (groups[:, 1] << 2)
+            | (groups[:, 2] << 4)
+            | (groups[:, 3] << 6)
+        ).to(torch.uint8)
+    elif n_bits == 4:
+        groups = values.reshape(-1, 2)
+        packed = (groups[:, 0] | (groups[:, 1] << 4)).to(torch.uint8)
+    elif n_bits == 3:
+        groups = values.reshape(-1, 8)
+        packed = torch.empty(
+            (groups.shape[0], 3), dtype=torch.uint8, device=indices.device
         )
-        dest[:, 2] = (g[:, 5] >> 1) | (g[:, 6] << 2) | (g[:, 7] << 5)
-        return packed
-
-    # 6 bits: four values occupy exactly three bytes.
-    g = x.reshape(-1, 4)
-    dest = packed.reshape(-1, 3)
-    dest[:, 0] = g[:, 0] | ((g[:, 1] & 0x03) << 6)
-    dest[:, 1] = (g[:, 1] >> 2) | ((g[:, 2] & 0x0F) << 4)
-    dest[:, 2] = (g[:, 2] >> 4) | (g[:, 3] << 2)
-    return packed
+        packed[:, 0] = (
+            groups[:, 0] | (groups[:, 1] << 3) | ((groups[:, 2] & 0x03) << 6)
+        ).to(torch.uint8)
+        packed[:, 1] = (
+            (groups[:, 2] >> 2)
+            | (groups[:, 3] << 1)
+            | (groups[:, 4] << 4)
+            | ((groups[:, 5] & 0x01) << 7)
+        ).to(torch.uint8)
+        packed[:, 2] = (
+            (groups[:, 5] >> 1) | (groups[:, 6] << 2) | (groups[:, 7] << 5)
+        ).to(torch.uint8)
+    else:
+        groups = values.reshape(-1, 4)
+        packed = torch.empty(
+            (groups.shape[0], 3), dtype=torch.uint8, device=indices.device
+        )
+        packed[:, 0] = (groups[:, 0] | ((groups[:, 1] & 0x03) << 6)).to(torch.uint8)
+        packed[:, 1] = ((groups[:, 1] >> 2) | ((groups[:, 2] & 0x0F) << 4)).to(
+            torch.uint8
+        )
+        packed[:, 2] = ((groups[:, 2] >> 4) | (groups[:, 3] << 2)).to(torch.uint8)
+    return packed.reshape(-1)[: packed_index_numel(original_numel, n_bits)]
 
 
 def unpack_nbit_indices(
-    packed_indices: torch.Tensor,
+    packed: torch.Tensor,
     n_bits: int,
     num_values: int,
 ) -> torch.Tensor:
-    """Unpack a dense n-bit stream to one uint8 bucket index per value."""
-    _validate_n_bits(n_bits)
-    p = packed_indices.reshape(-1).to(torch.uint8)
-    if num_values == 0:
-        return p.new_empty(0)
-    expected = packed_num_bytes(num_values, n_bits)
-    if p.numel() != expected:
+    """Unpack a little-endian n-bit stream to uint8 indices."""
+    if n_bits not in SUPPORTED_N_BITS:
+        raise ValueError(f"n_bits must be one of {SUPPORTED_N_BITS}, got {n_bits}")
+    if num_values < 0:
+        raise ValueError(f"num_values must be non-negative, got {num_values}")
+    flat = packed.reshape(-1).to(torch.uint8)
+    expected = packed_index_numel(num_values, n_bits)
+    if flat.numel() != expected:
         raise ValueError(
-            f"packed index length mismatch: expected {expected}, got {p.numel()}"
+            f"packed stream must contain {expected} bytes, got {flat.numel()}"
         )
-
     if n_bits == 8:
-        return p[:num_values].contiguous()
+        return flat[:num_values].contiguous()
 
-    if n_bits == 4:
-        out = torch.empty((p.numel(), 2), dtype=torch.uint8, device=p.device)
-        out[:, 0] = p & 0x0F
-        out[:, 1] = p >> 4
-        return out.reshape(-1)[:num_values]
-
+    values = flat.to(torch.int32)
     if n_bits == 2:
-        out = torch.empty((p.numel(), 4), dtype=torch.uint8, device=p.device)
-        out[:, 0] = p & 0x03
-        out[:, 1] = (p >> 2) & 0x03
-        out[:, 2] = (p >> 4) & 0x03
-        out[:, 3] = p >> 6
+        out = torch.empty((values.numel(), 4), dtype=torch.uint8, device=flat.device)
+        out[:, 0] = (values & 0x03).to(torch.uint8)
+        out[:, 1] = ((values >> 2) & 0x03).to(torch.uint8)
+        out[:, 2] = ((values >> 4) & 0x03).to(torch.uint8)
+        out[:, 3] = ((values >> 6) & 0x03).to(torch.uint8)
+        return out.reshape(-1)[:num_values]
+    if n_bits == 4:
+        out = torch.empty((values.numel(), 2), dtype=torch.uint8, device=flat.device)
+        out[:, 0] = (values & 0x0F).to(torch.uint8)
+        out[:, 1] = ((values >> 4) & 0x0F).to(torch.uint8)
         return out.reshape(-1)[:num_values]
 
+    remainder = values.numel() % 3
+    if remainder:
+        padded = values.new_zeros(values.numel() + 3 - remainder)
+        padded[: values.numel()].copy_(values)
+        values = padded
+    groups = values.reshape(-1, 3)
+    b0, b1, b2 = groups[:, 0], groups[:, 1], groups[:, 2]
     if n_bits == 3:
-        g = p.reshape(-1, 3)
-        out = torch.empty((g.shape[0], 8), dtype=torch.uint8, device=p.device)
-        b0, b1, b2 = g[:, 0], g[:, 1], g[:, 2]
-        out[:, 0] = b0 & 0x07
-        out[:, 1] = (b0 >> 3) & 0x07
-        out[:, 2] = ((b0 >> 6) | (b1 << 2)) & 0x07
-        out[:, 3] = (b1 >> 1) & 0x07
-        out[:, 4] = (b1 >> 4) & 0x07
-        out[:, 5] = ((b1 >> 7) | (b2 << 1)) & 0x07
-        out[:, 6] = (b2 >> 2) & 0x07
-        out[:, 7] = (b2 >> 5) & 0x07
-        return out.reshape(-1)[:num_values]
-
-    g = p.reshape(-1, 3)
-    out = torch.empty((g.shape[0], 4), dtype=torch.uint8, device=p.device)
-    b0, b1, b2 = g[:, 0], g[:, 1], g[:, 2]
-    out[:, 0] = b0 & 0x3F
-    out[:, 1] = ((b0 >> 6) | (b1 << 2)) & 0x3F
-    out[:, 2] = ((b1 >> 4) | (b2 << 4)) & 0x3F
-    out[:, 3] = (b2 >> 2) & 0x3F
+        out = torch.empty((groups.shape[0], 8), dtype=torch.uint8, device=flat.device)
+        out[:, 0] = (b0 & 0x07).to(torch.uint8)
+        out[:, 1] = ((b0 >> 3) & 0x07).to(torch.uint8)
+        out[:, 2] = (((b0 >> 6) & 0x03) | ((b1 & 0x01) << 2)).to(torch.uint8)
+        out[:, 3] = ((b1 >> 1) & 0x07).to(torch.uint8)
+        out[:, 4] = ((b1 >> 4) & 0x07).to(torch.uint8)
+        out[:, 5] = (((b1 >> 7) & 0x01) | ((b2 & 0x03) << 1)).to(torch.uint8)
+        out[:, 6] = ((b2 >> 2) & 0x07).to(torch.uint8)
+        out[:, 7] = ((b2 >> 5) & 0x07).to(torch.uint8)
+    else:
+        out = torch.empty((groups.shape[0], 4), dtype=torch.uint8, device=flat.device)
+        out[:, 0] = (b0 & 0x3F).to(torch.uint8)
+        out[:, 1] = (((b0 >> 6) & 0x03) | ((b1 & 0x0F) << 2)).to(torch.uint8)
+        out[:, 2] = (((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4)).to(torch.uint8)
+        out[:, 3] = ((b2 >> 2) & 0x3F).to(torch.uint8)
     return out.reshape(-1)[:num_values]
 
 
-# ---------------------------------------------------------------------------
-# Shared log-grid helpers
-# ---------------------------------------------------------------------------
-
-
-def _stored_log_grid(log_blocks: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    """Build the existing center-coded grid and its persisted fp16 endpoints."""
-    log_min = log_blocks.amin(dim=1)
-    log_max = log_blocks.amax(dim=1)
-    scales = torch.stack((log_min, log_max), dim=1).to(torch.float16)
-    span = (log_max - log_min).unsqueeze(1)
-    normalized = log_blocks.sub_(log_min.unsqueeze(1)).div_(
-        span.clamp_min(_SPAN_FLOOR)
-    ).clamp_(0.0, 1.0)
-    return scales, log_min.unsqueeze(1), log_max.unsqueeze(1), span, normalized
-
-
-def _quantize_centers(
-    normalized: torch.Tensor,
-    n_buckets: int,
-    stochastic_round: bool,
-) -> torch.Tensor:
-    """Quantize normalized values to the center-coded grid used by the decoder."""
-    if stochastic_round:
-        # Decode uses (idx + 0.5) / n_buckets. Stochastic rounding in this
-        # coordinate is unbiased in log-space inside the representable range;
-        # the two edge half-bins necessarily clip to the nearest endpoint code.
-        position = normalized.mul_(n_buckets).sub_(0.5).clamp_(
-            0.0, n_buckets - 1.0
-        )
-        lower = position.floor()
-        position.sub_(lower)  # reuse the normalized buffer as the up-probability
-        round_up = torch.rand_like(position).lt_(position)
-        return lower.add_(round_up).to(torch.uint8)
-
-    # For center-coded bins, floor(normalized*K) is nearest-center assignment.
-    return normalized.mul_(n_buckets).clamp_(0.0, n_buckets - 1.0).to(
-        torch.uint8
-    )
-
-
-def _dequantize_indices(
-    indices: torch.Tensor,
-    scales: torch.Tensor,
-    n_buckets: int,
+def _validate_quantizer_input(
+    values: torch.Tensor,
+    n_bits: int,
     block_size: int,
+) -> None:
+    validate_block_size(block_size)
+    if values.ndim != 1:
+        raise ValueError(f"values must be 1-D, got shape {tuple(values.shape)}")
+    if values.numel() == 0:
+        raise ValueError("cannot quantize an empty tensor")
+    if values.numel() % block_size:
+        raise ValueError(
+            f"length {values.numel()} must be divisible by block_size {block_size}"
+        )
+    if n_bits not in SUPPORTED_N_BITS:
+        raise ValueError(f"n_bits must be one of {SUPPORTED_N_BITS}, got {n_bits}")
+
+
+def _outward_fp16_log_scales(
+    log_min: torch.Tensor,
+    log_max: torch.Tensor,
 ) -> torch.Tensor:
-    num_blocks = scales.shape[0]
-    values = indices.reshape(num_blocks, block_size).float()
-    log_min = scales[:, 0].float().unsqueeze(1)
-    span = (scales[:, 1].float() - scales[:, 0].float()).unsqueeze(1)
-    return values.add_(0.5).div_(n_buckets).mul_(span).add_(log_min).exp_()
+    log_min = log_min.clamp(max=MAX_SAFE_LOG_FP16)
+    log_max = log_max.clamp(max=MAX_SAFE_LOG_FP16)
+    min_half = log_min.to(torch.float16)
+    max_half = log_max.to(torch.float16)
+    dynamic = log_max > log_min
 
-
-# ---------------------------------------------------------------------------
-# Legacy 2-bit API
-# ---------------------------------------------------------------------------
+    min_out = torch.nextafter(min_half, torch.full_like(min_half, -float("inf")))
+    max_out = torch.nextafter(max_half, torch.full_like(max_half, float("inf")))
+    min_half = torch.where(dynamic & (min_half.float() > log_min), min_out, min_half)
+    max_half = torch.where(
+        dynamic & (max_half.float() < log_max),
+        max_out.clamp(max=MAX_SAFE_LOG_FP16),
+        max_half,
+    )
+    return torch.stack((min_half, max_half), dim=1)
 
 
 def quantize_logscale(
-    v_flat: torch.Tensor, block_size: int = BLOCK_SIZE
+    values: torch.Tensor,
+    n_bits: int = 4,
+    block_size: int = BLOCK_SIZE,
+    stochastic_round: bool = False,
+    *,
+    seed: int = 0,
+    out_indices: torch.Tensor | None = None,
+    out_scales: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a flat positive tensor to packed 2-bit log-scale indices."""
-    indices, scales, _ = quantize_logscale_nbits(
-        v_flat,
-        n_bits=2,
-        block_size=block_size,
-        stochastic_round=False,
-        packed=True,
+    """Quantize a padded positive tensor with packed endpoint log levels."""
+    _validate_quantizer_input(values, n_bits, block_size)
+    num_blocks = values.numel() // block_size
+    blocks = values.reshape(num_blocks, block_size).float().clamp_min(MIN_POSITIVE)
+    blocks = blocks.clamp_max(torch.finfo(torch.float32).max)
+    log_blocks = blocks.log()
+    scales = _outward_fp16_log_scales(log_blocks.amin(1), log_blocks.amax(1))
+
+    intervals = (1 << n_bits) - 1
+    log_min = scales[:, 0].float().unsqueeze(1)
+    log_max = scales[:, 1].float().unsqueeze(1)
+    step = (log_max - log_min) / intervals
+    position = ((log_blocks - log_min) / step.clamp_min(1.0e-10)).clamp(
+        0.0, float(intervals)
     )
-    return indices, scales
+    if stochastic_round:
+        lower = position.floor().clamp(0, intervals)
+        upper = (lower + 1.0).clamp(max=intervals)
+        lower_value = torch.exp(log_min + lower * step)
+        upper_value = torch.exp(log_min + upper * step)
+        probability_up = (
+            (blocks - lower_value)
+            / (upper_value - lower_value).clamp_min(torch.finfo(torch.float32).tiny)
+        ).clamp(0.0, 1.0)
+        probability_up = torch.where(
+            upper > lower, probability_up, torch.zeros_like(probability_up)
+        )
+        random = counter_uniform(
+            probability_up.numel(),
+            seed,
+            device=probability_up.device,
+            antithetic_pairs=True,
+        ).reshape_as(probability_up)
+        unpacked = lower + (random < probability_up).to(lower.dtype)
+    else:
+        unpacked = torch.floor(position + 0.5).clamp(0, intervals)
+    packed = pack_nbit_indices(unpacked.to(torch.uint8).reshape(-1), n_bits)
+
+    if out_indices is not None:
+        if (
+            out_indices.dtype != torch.uint8
+            or out_indices.shape != packed.shape
+            or out_indices.device != packed.device
+        ):
+            raise ValueError("out_indices must match packed uint8 storage")
+        out_indices.copy_(packed)
+        packed = out_indices
+    if out_scales is not None:
+        if (
+            out_scales.dtype != torch.float16
+            or out_scales.shape != scales.shape
+            or out_scales.device != scales.device
+        ):
+            raise ValueError("out_scales must match fp16 endpoint storage")
+        out_scales.copy_(scales)
+        scales = out_scales
+    return packed, scales
 
 
 def dequantize_logscale(
-    packed: torch.Tensor,
-    scales: torch.Tensor,
-    block_size: int = BLOCK_SIZE,
-    original_numel: int = 0,
-) -> torch.Tensor:
-    """Reconstruct fp32 values from packed 2-bit log-scale indices."""
-    return dequantize_logscale_nbits(
-        packed,
-        scales,
-        n_bits=2,
-        block_size=block_size,
-        original_numel=original_numel,
-        packed=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Generalized n-bit log-scale quantization
-# ---------------------------------------------------------------------------
-
-
-def quantize_logscale_nbits(
-    v_flat: torch.Tensor,
-    n_bits: int = 3,
-    block_size: int = BLOCK_SIZE,
-    stochastic_round: bool = False,
-    packed: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Quantize a flat positive tensor to n-bit log-scale indices per block.
-
-    Args:
-        v_flat: 1-D tensor of positive values, padded to full blocks.
-        n_bits: Bits per element (2, 3, 4, 6, or 8).
-        block_size: Elements per independent block.
-        stochastic_round: Use stochastic rounding on the center-coded log grid.
-        packed: Densely bit-pack the returned indices. The default remains
-            False for compatibility; TurboAdam's persistent state uses True.
-
-    Returns:
-        (indices, scales, n_bits), where scales stores fp16 (log_min, log_max).
-    """
-    _validate_n_bits(n_bits)
-    if v_flat.ndim != 1:
-        raise ValueError(f"v_flat must be 1-D, got shape {tuple(v_flat.shape)}")
-    if block_size <= 0 or v_flat.shape[0] % block_size != 0:
-        raise ValueError("v_flat length must be a multiple of positive block_size")
-    if v_flat.numel() == 0:
-        return (
-            torch.empty(0, dtype=torch.uint8, device=v_flat.device),
-            torch.empty((0, 2), dtype=torch.float16, device=v_flat.device),
-            n_bits,
-        )
-
-    num_blocks = v_flat.shape[0] // block_size
-    n_buckets = 1 << n_bits
-    log_blocks = v_flat.reshape(num_blocks, block_size).to(
-        dtype=torch.float32, copy=True
-    )
-    log_blocks.clamp_min_(_LOG_FLOOR).log_()
-    scales, _, _, _, normalized = _stored_log_grid(log_blocks)
-    indices = _quantize_centers(normalized, n_buckets, stochastic_round).reshape(-1)
-    if packed:
-        indices = pack_nbit_indices(indices, n_bits)
-    return indices, scales, n_bits
-
-
-def dequantize_logscale_nbits(
     indices: torch.Tensor,
     scales: torch.Tensor,
-    n_bits: int = 3,
+    n_bits: int = 4,
     block_size: int = BLOCK_SIZE,
     original_numel: int = 0,
-    packed: bool | None = None,
 ) -> torch.Tensor:
-    """Reconstruct fp32 values from packed or unpacked n-bit indices."""
-    _validate_n_bits(n_bits)
+    """Reconstruct fp32 values from packed endpoint log levels."""
+    validate_block_size(block_size)
+    if n_bits not in SUPPORTED_N_BITS:
+        raise ValueError(f"n_bits must be one of {SUPPORTED_N_BITS}, got {n_bits}")
+    if scales.ndim != 2 or scales.shape[1] != 2:
+        raise ValueError(f"scales must have shape (num_blocks, 2), got {scales.shape}")
     num_blocks = scales.shape[0]
     padded_numel = num_blocks * block_size
     if original_numel == 0:
         original_numel = padded_numel
-    if original_numel < 0 or original_numel > padded_numel:
-        raise ValueError("original_numel must lie inside the encoded padded length")
-    if padded_numel == 0:
-        return torch.empty(0, dtype=torch.float32, device=scales.device)
-
-    is_packed = _infer_packed(indices, n_bits, num_blocks, block_size, packed)
-    if is_packed:
-        decoded_indices = unpack_nbit_indices(indices, n_bits, padded_numel)
-    else:
-        if indices.numel() != padded_numel:
-            raise ValueError(
-                "unpacked index length mismatch: "
-                f"expected {padded_numel}, got {indices.numel()}"
-            )
-        decoded_indices = indices.reshape(-1).to(torch.uint8)
-
-    values = _dequantize_indices(decoded_indices, scales, 1 << n_bits, block_size)
+    if not 0 <= original_numel <= padded_numel:
+        raise ValueError(
+            f"original_numel must lie in [0, {padded_numel}], got {original_numel}"
+        )
+    unpacked = unpack_nbit_indices(indices, n_bits, padded_numel)
+    coordinate = unpacked.reshape(num_blocks, block_size).float()
+    coordinate.div_(float((1 << n_bits) - 1))
+    log_min = scales[:, 0].float().unsqueeze(1)
+    log_max = scales[:, 1].float().unsqueeze(1)
+    values = torch.exp(log_min + coordinate * (log_max - log_min))
     return values.reshape(-1)[:original_numel]
 
 
-# ---------------------------------------------------------------------------
-# Fused decompress → EMA → recompress
-# ---------------------------------------------------------------------------
-
-
-def _updated_v_state(
-    indices: torch.Tensor,
-    scales: torch.Tensor,
-    grad: torch.Tensor,
-    beta2: float,
-    n_bits: int,
-    block_size: int,
-    original_numel: int,
-    packed: bool | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
-    """Internal PyTorch reference core used by both public update functions."""
-    _validate_n_bits(n_bits)
-    num_blocks = scales.shape[0]
+def initialize_v_state(
+    shape: torch.Size | tuple[int, ...],
+    *,
+    device: torch.device,
+    n_bits: int = 4,
+    block_size: int = BLOCK_SIZE,
+    initial_value: float = 1.0e-30,
+) -> dict:
+    """Create a constant packed second-moment state."""
+    validate_block_size(block_size)
+    if n_bits not in SUPPORTED_N_BITS:
+        raise ValueError(f"n_bits must be one of {SUPPORTED_N_BITS}, got {n_bits}")
+    original_length = math.prod(shape)
+    if original_length <= 0:
+        raise ValueError("compressed optimizer state requires a non-empty tensor")
+    num_blocks = ceil_div(original_length, block_size)
     padded_numel = num_blocks * block_size
-    if original_numel != grad.numel():
+    log_value = math.log(max(float(initial_value), MIN_POSITIVE))
+    state = {
+        "indices": torch.zeros(
+            packed_index_numel(padded_numel, n_bits),
+            dtype=torch.uint8,
+            device=device,
+        ),
+        "scales": torch.full(
+            (num_blocks, 2), log_value, dtype=torch.float16, device=device
+        ),
+        "n_bits": n_bits,
+        "original_shape": tuple(shape),
+        "original_length": original_length,
+        "block_size": block_size,
+    }
+    validate_v_state(state)
+    return state
+
+
+def validate_v_state(state: dict) -> None:
+    """Validate the current packed second-moment schema."""
+    if set(state) != _V_STATE_KEYS:
+        missing = sorted(_V_STATE_KEYS - set(state))
+        unexpected = sorted(set(state) - _V_STATE_KEYS)
         raise ValueError(
-            f"gradient has {grad.numel()} elements, expected {original_numel}"
+            f"invalid v_state fields; missing={missing}, unexpected={unexpected}"
         )
-    if padded_numel == 0:
-        is_packed = bool(packed)
-        return (
-            grad.new_empty((0, block_size), dtype=torch.float32),
-            indices,
-            scales,
-            is_packed,
-        )
+    n_bits = int(state["n_bits"])
+    block_size = int(state["block_size"])
+    original_length = int(state["original_length"])
+    shape = tuple(state["original_shape"])
+    validate_block_size(block_size)
+    if n_bits not in SUPPORTED_N_BITS:
+        raise ValueError(f"n_bits must be one of {SUPPORTED_N_BITS}, got {n_bits}")
+    if original_length <= 0 or math.prod(shape) != original_length:
+        raise ValueError("v_state shape and original_length disagree")
+    num_blocks = ceil_div(original_length, block_size)
+    padded_numel = num_blocks * block_size
+    indices = state["indices"]
+    scales = state["scales"]
+    if (
+        not isinstance(indices, torch.Tensor)
+        or indices.dtype != torch.uint8
+        or indices.numel() != packed_index_numel(padded_numel, n_bits)
+        or not indices.is_contiguous()
+    ):
+        raise ValueError("invalid packed v_state indices")
+    if (
+        not isinstance(scales, torch.Tensor)
+        or scales.dtype != torch.float16
+        or scales.shape != (num_blocks, 2)
+        or not scales.is_contiguous()
+    ):
+        raise ValueError("invalid v_state endpoint scales")
 
-    is_packed = _infer_packed(indices, n_bits, num_blocks, block_size, packed)
-    decoded_indices = (
-        unpack_nbit_indices(indices, n_bits, padded_numel)
-        if is_packed
-        else indices.reshape(-1).to(torch.uint8)
+
+def restore_v_state(state: dict, *, device: torch.device) -> dict:
+    """Copy a current packed second-moment checkpoint to a parameter device."""
+    validate_v_state(state)
+    restored = {
+        key: value.detach().to(device=device, copy=True).contiguous()
+        if isinstance(value, torch.Tensor)
+        else value
+        for key, value in state.items()
+    }
+    validate_v_state(restored)
+    return restored
+
+
+def decompress_v_state(state: dict) -> torch.Tensor:
+    """Decode a packed second-moment state to its original shape."""
+    validate_v_state(state)
+    flat = dequantize_logscale(
+        state["indices"],
+        state["scales"],
+        int(state["n_bits"]),
+        int(state["block_size"]),
+        int(state["original_length"]),
     )
-    v_blocks = _dequantize_indices(decoded_indices, scales, 1 << n_bits, block_size)
-
-    # Update valid values without materializing a padded g² tensor.
-    v_blocks.mul_(beta2)
-    v_flat = v_blocks.reshape(-1)
-    g_flat = grad.reshape(-1).float()
-    v_flat[:original_numel].addcmul_(g_flat, g_flat, value=1.0 - beta2)
-
-    log_blocks = v_blocks.clone().clamp_min_(_LOG_FLOOR).log_()
-    new_log_min = log_blocks.amin(dim=1)
-    new_log_max = log_blocks.amax(dim=1)
-
-    # Only the final block can contain padding. Exclude it from its statistics.
-    remainder = original_numel % block_size
-    if remainder:
-        valid_last = log_blocks[-1, :remainder]
-        new_log_min[-1] = valid_last.amin()
-        new_log_max[-1] = valid_last.amax()
-
-    # The old endpoints are dead after dequantization, so rewrite their tiny
-    # persistent buffer in place instead of allocating a second scale tensor.
-    scales[:, 0].copy_(new_log_min)
-    scales[:, 1].copy_(new_log_max)
-    new_scales = scales
-    new_span = (new_log_max - new_log_min).unsqueeze(1).clamp_min(_SPAN_FLOOR)
-    normalized = log_blocks.sub_(new_log_min.unsqueeze(1)).div_(
-        new_span
-    ).clamp_(0.0, 1.0)
-    if remainder:
-        normalized[-1, remainder:] = 0.0
-
-    new_unpacked = _quantize_centers(normalized, 1 << n_bits, True).reshape(-1)
-    new_indices = (
-        pack_nbit_indices(new_unpacked, n_bits, out=indices)
-        if is_packed
-        else new_unpacked
-    )
-    return v_blocks, new_indices, new_scales, is_packed
+    return flat.reshape(tuple(state["original_shape"]))
 
 
-def fused_v_update(
-    indices: torch.Tensor,
-    scales: torch.Tensor,
-    grad: torch.Tensor,
-    beta2: float,
-    n_bits: int,
-    block_size: int,
-    original_numel: int,
-    packed: bool | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Decompress v, apply its EMA update, and recompress in one PyTorch path.
-
-    The returned fp32 v is the exact post-EMA value used for the current Adam
-    denominator; quantization affects the state carried into the next step.
-    """
-    v_blocks, new_indices, new_scales, _ = _updated_v_state(
-        indices,
-        scales,
-        grad,
-        beta2,
-        n_bits,
+def recompress_v_state(
+    state: dict,
+    current_v: torch.Tensor,
+    *,
+    seed: int,
+) -> torch.Tensor:
+    """Persist a current second moment and return its decoded state."""
+    validate_v_state(state)
+    if current_v.numel() != int(state["original_length"]):
+        raise ValueError("current_v size does not match v_state")
+    flat = current_v.reshape(-1).float()
+    block_size = int(state["block_size"])
+    remainder = flat.numel() % block_size
+    pad_value = flat[-remainder:].amin() if remainder else MIN_POSITIVE
+    padded, _ = pad_to_blocks(flat, block_size, pad_value=pad_value)
+    quantize_logscale(
+        padded,
+        int(state["n_bits"]),
         block_size,
-        original_numel,
-        packed,
+        stochastic_round=True,
+        seed=seed,
+        out_indices=state["indices"],
+        out_scales=state["scales"],
     )
-    return new_indices, new_scales, v_blocks.reshape(-1)[:original_numel]
+    return dequantize_logscale(
+        state["indices"],
+        state["scales"],
+        int(state["n_bits"]),
+        block_size,
+        int(state["original_length"]),
+    ).reshape(current_v.shape)
 
 
-@torch.no_grad()
-def fused_adam_update(
-    indices: torch.Tensor,
-    scales: torch.Tensor,
-    grad: torch.Tensor,
-    param: torch.Tensor,
-    first_moment: torch.Tensor,
+def update_v_state(
+    state: dict,
+    gradient: torch.Tensor,
     beta2: float,
-    n_bits: int,
-    block_size: int,
-    original_numel: int,
-    lr: float,
-    bias_correction1: float,
-    bias_correction2: float,
-    eps: float,
-    weight_decay: float,
-    packed: bool | None = None,
+    *,
+    seed: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused reference path: v update, AdamW parameter update, and recompression.
+    """Decode, update, persist, and return current and persisted v."""
+    if not 0.0 <= beta2 < 1.0:
+        raise ValueError(f"beta2 must lie in [0, 1), got {beta2}")
+    current = decompress_v_state(state).reshape(-1)
+    grad = gradient.reshape(-1).float()
+    if grad.numel() != current.numel():
+        raise ValueError("gradient size does not match v_state")
+    current.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+    persisted = recompress_v_state(state, current, seed=seed)
+    return current.reshape(gradient.shape), persisted.reshape(gradient.shape)
 
-    The v buffer is reused in-place as the denominator after its new quantized
-    representation has been produced, avoiding another full-size fp32 tensor.
-    """
-    v_blocks, new_indices, new_scales, _ = _updated_v_state(
-        indices,
-        scales,
-        grad,
-        beta2,
-        n_bits,
-        block_size,
-        original_numel,
-        packed,
-    )
-    if original_numel == 0:
-        return new_indices, new_scales
 
-    denom = v_blocks.reshape(-1)[:original_numel]
-    denom.sqrt_().div_(math.sqrt(bias_correction2)).add_(eps)
-    if weight_decay != 0.0:
-        param.mul_(1.0 - lr * weight_decay)
-    param.addcdiv_(
-        first_moment.reshape_as(param),
-        denom.reshape_as(param),
-        value=-(lr / bias_correction1),
-    )
-    return new_indices, new_scales
+__all__ = [
+    "MAX_SAFE_LOG_FP16",
+    "MIN_POSITIVE",
+    "SUPPORTED_N_BITS",
+    "counter_uniform",
+    "decompress_v_state",
+    "dequantize_logscale",
+    "initialize_v_state",
+    "pack_nbit_indices",
+    "packed_index_numel",
+    "quantize_logscale",
+    "recompress_v_state",
+    "restore_v_state",
+    "unpack_nbit_indices",
+    "update_v_state",
+    "validate_v_state",
+]

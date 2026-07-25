@@ -21,11 +21,15 @@ experiments/checkpoints/
 CLAUDE.md
 TASK.md
 docs/research/
+docs/audits/
 docs/specs/
 docs/superpowers/
 
 # pytest
 .pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
 
 # Local CUDA/Triton verification caches
 .tmp/

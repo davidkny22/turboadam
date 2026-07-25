@@ -1,8 +1,8 @@
 # TurboAdam
 
-[![Tests](https://img.shields.io/badge/tests-151%2F151-brightgreen)]() [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]() [![PyTorch](https://img.shields.io/badge/PyTorch-2.2%2B-orange)]() [![License](https://img.shields.io/badge/license-MIT-green)]()
+[![Tests](https://img.shields.io/badge/tests-101%20passing-brightgreen)](https://github.com/davidkny22/turboadam/tree/main/tests) [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/) [![PyTorch](https://img.shields.io/badge/PyTorch-2.2%2B-orange)](https://pytorch.org/) [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-**Drop-in Adam/AdamW replacement with 6.5× optimizer-state memory reduction.**
+**A drop-in AdamW replacement with 9.845× smaller persistent optimizer state.**
 
 One line change. No model modifications. No training-loop changes.
 
@@ -12,19 +12,35 @@ from turboadam import TurboAdam
 optimizer = TurboAdam(model.parameters(), lr=1e-3)
 ```
 
+TurboAdam keeps the AdamW recurrences and parameter update. It computes each
+step from fp32 transient moments, then persists the first moment with UState and
+the second moment with 1Q.
+
 ---
 
 ## Why TurboAdam?
 
-Adam stores two full-precision copies of every parameter (first and second moments). For a 7B model that is **28 GB** of optimizer state alone: often the memory bottleneck that forces smaller batch sizes or shorter context lengths.
+AdamW keeps two fp32 moment tensors for every trained parameter. That is 64
+bits, or 8 bytes, of persistent optimizer state per parameter before allocator
+overhead.
 
-TurboAdam compresses both moments in-place during training, cutting optimizer-state memory from **64 bits/param → 9.9 bits/param** (6.5× reduction). On GPT-2 124M it converges within **+0.25 loss points** of full-precision AdamW (**1.2% relative**: within run-to-run noise).
+TurboAdam reduces the default state to approximately **6.50 bits per parameter
+value** on large aligned tensors. The two moments remain active at every step;
+only the representation persisted between steps changes.
 
-| Model size | AdamW optimizer state | TurboAdam | Savings |
-|-----------|----------------------|-----------|---------|
-| 125M (GPT-2) | 0.50 GB | 0.08 GB | **0.42 GB** |
-| 7B | 28.0 GB | **4.3 GB** | **23.7 GB** |
-| 70B | 280.0 GB | **43.0 GB** | **237.0 GB** |
+| Parameters | AdamW moments | TurboAdam state | Difference |
+| ---: | ---: | ---: | ---: |
+| 125M | 1.00 GB | **0.102 GB** | **0.898 GB** |
+| 7B | 56.0 GB | **5.69 GB** | **50.3 GB** |
+| 70B | 560 GB | **56.9 GB** | **503 GB** |
+
+These are decimal estimates for large aligned tensors. They exclude
+parameters, gradients, allocator effects, block padding, and per-tensor
+scalars.
+
+Memory is only useful if the optimizer still trains well. In matched 500-step
+GPT-2 runs, the default ends 1.224% behind AdamW on TinyStories and 0.094% ahead
+on WikiText-103. The complete memory, convergence, and speed results are below.
 
 ---
 
@@ -32,17 +48,28 @@ TurboAdam compresses both moments in-place during training, cutting optimizer-st
 
 ### Install
 
+Install the PyTorch build for your target accelerator, then install TurboAdam
+with its platform Triton package:
+
+```bash
+pip install "turboadam[triton]"
+```
+
+An existing compatible CUDA PyTorch installation satisfies TurboAdam's
+dependency and is left in place. When PyTorch is absent, pip resolves the build
+available from the configured package index.
+
+For CPU or MPS without Triton:
+
 ```bash
 pip install turboadam
 ```
 
-For the latest source version:
+For an editable source installation:
 
 ```bash
-pip install git+https://github.com/davidkny22/turboadam.git
+pip install -e ".[triton]"
 ```
-
-Requirements: Python >=3.10, PyTorch >=2.2, Triton (optional, for CUDA speed-ups).
 
 ### Use
 
@@ -52,12 +79,10 @@ from turboadam import TurboAdam
 # Drop-in replacement for torch.optim.AdamW
 optimizer = TurboAdam(
     model.parameters(),
-    lr=6e-4,
+    lr=3e-4,
     betas=(0.9, 0.999),
+    eps=1e-8,
     weight_decay=0.01,
-    v_bits=4,          # 2, 3, 4, 6, or 8
-    compress_m=True,   # CoState first-moment compression
-    compress_v=True,   # Log-scale second-moment compression
 )
 ```
 
@@ -65,77 +90,148 @@ optimizer = TurboAdam(
 
 ## How it works
 
-TurboAdam combines two independent, separable compression techniques. You can enable either or both.
+TurboAdam combines two separable state representations. UState compresses the
+first moment to approximately 2.25 bits per value. 1Q compresses the second
+moment to 4.25 bits per value by default. Either representation can be disabled
+independently.
 
-### 1Q: Second-moment (v) compression
+### UState: first-moment compression
 
-v is stored as n-bit **log-scale quantized** values per 128-element block:
+UState stores the first moment in normalized Adam update units:
 
-1. **Decompress** block min/max → reconstruct v via exp interpolation
-2. **EMA update**: `v_new = β₂·v_old + (1-β₂)·g²`
-3. **Bias-correct** denominator: `denom = √(v / (1-β₂ᵗ)) + ε`
-4. **Re-compress** with **stochastic rounding** (unbiased, prevents systematic EMA drift)
+```text
+q_t = (m_t / (1 - beta1^t))
+      / (sqrt(v_persisted_t / (1 - beta2^t)) + eps)
+```
 
-Storage per block: `n_bits` uint8 indices + 2× fp16 scales.  
-Default **4-bit** = **4.25 bits/param**.
+Given the same persisted second moment, an unquantized `q_t` reconstructs
+`m_t` exactly. The default UState layout is:
 
-**Key insight:** Theoretical analysis predicted 4-bit would fail due to accumulated quantization noise (22× amplification from β₂=0.999 EMA). In practice it works because quantization errors are correlated: same elements map to the same buckets step-to-step.
+| State | Storage |
+| --- | ---: |
+| Four-level packed code | 2.00 bits/value |
+| One bf16 mean per 64 values | 0.25 bits/value |
+| Decode scale, encode scale, RMS accumulator | 12 bytes/tensor |
 
-### CoState: First-moment (m) compression
+Each decoded mean block is recentered so its stored bf16 mean is preserved.
+Codes use antithetic stochastic rounding and a one-step-lagged tensor scale.
+The default scale factor is 1.1.
 
-Gradient-residual decomposition: `m = α·g + δ`
+**Key insight:** AdamW applies the first moment through a normalized update.
+UState persists that normalized quantity directly, so its compact codes spend
+their resolution in the coordinate system that reaches the parameter update.
 
-- `α = (m·g) / (g·g)`: scalar projection onto current gradient
-- `δ = m - α·g`: residual orthogonal to gradient
+The finite coordinate bound requires `beta1**2 < beta2` when UState is active.
+TurboAdam validates the condition at construction.
 
-δ is partitioned into 128-element blocks and classified into three **costates**:
+### 1Q: second-moment compression
 
-| Costate | Condition | Storage | Typical share |
-|---------|-----------|---------|---------------|
-| **Null** | `r < P₁₀` | 1-bit flag | ~10% |
-| **Phase** | `P₁₀ ≤ r < P₉₀` | 1-bit sign per element | ~80% |
-| **Amplitude** | `r ≥ P₉₀` | 1-bit sign + fp16 block scale | ~10% |
+The second moment is nonnegative and spans orders of magnitude. 1Q stores each
+block on a logarithmic grid using packed indices and two fp16 log endpoints.
 
-**Key insight:** For Adam, direction matters more than magnitude because `m/√v` normalizes per-element. Sign-only encoding preserves direction for 80% of components. This is why CoState works at ~2 bits/param while low-rank approaches fail: they preserve magnitude for few directions but lose direction for many.
+With the default 4-bit indices and 128-value blocks:
+
+| State | Storage |
+| --- | ---: |
+| Packed log index | 4.00 bits/value |
+| Two fp16 endpoints per 128 values | 0.25 bits/value |
+
+Stochastic rounding is performed between decoded positive values. The PyTorch
+and Triton paths use the same counter hash and require no persistent random
+buffer.
+
+**Key insight:** A logarithmic grid spends its levels on relative resolution.
+That matches a positive moment whose coordinates may differ by many orders of
+magnitude, while block-local endpoints adapt the grid to each region of the
+tensor.
+
+### The AdamW update remains AdamW
+
+TurboAdam applies the decoupled AdamW update:
+
+```text
+m_t = beta1 * m_(t-1) + (1 - beta1) * g_t
+v_t = beta2 * v_(t-1) + (1 - beta2) * g_t^2
+theta_t = (1 - lr * weight_decay) * theta_(t-1)
+          - lr * m_t / (1 - beta1^t)
+          / (sqrt(v_t / (1 - beta2^t)) + eps)
+```
+
+Compression affects the state presented to the next optimizer step. It does
+not replace the recurrence or the current parameter update with a different
+optimizer rule.
+
+### Fused CUDA path
+
+For supported contiguous CUDA tensors, one Triton kernel owns each state block
+and performs the complete update:
+
+1. Decode UState and 1Q.
+2. Reconstruct the prior first moment in the persisted second-moment frame.
+3. Form the current fp32 Adam moments.
+4. Apply the AdamW parameter update.
+5. Recompress the second moment with 1Q.
+6. Encode the next UState payload.
+
+A one-program finalizer rotates the UState scale and clears its scalar RMS
+accumulator. The wrapper allocates no parameter-sized optimizer workspace.
+
+The fused path supports contiguous CUDA parameters, power-of-two block sizes
+from 32 through 1024, UState mean blocks that divide the storage block, and 2,
+3, 4, 6, or 8 second-moment bits. Other layouts use the PyTorch reference path.
 
 ---
 
 ## Results
 
-### Memory
+### Persistent memory
 
-Measured on one GPT-2 layer (9 parameter tensors, CUDA).
+For 131,072 aligned values, the default state occupies 106,508 bytes:
 
-| Configuration | Persistent optimizer memory | vs AdamW |
-|--------------|----------------------------|----------|
-| AdamW (baseline) | 56.6 MB | 1.00× |
-| TurboAdam (v only, 4-bit) | 35.6 MB | **0.63×** |
-| TurboAdam (m only, CoState) | 29.6 MB | **0.52×** |
-| **TurboAdam (m + v, default)** | **8.6 MB** | **0.15×** |
+| Component | Bytes |
+| --- | ---: |
+| UState | 36,876 |
+| 1Q | 69,632 |
+| **Total** | **106,508** |
+
+This is 6.500732 bits per value and 9.845× smaller than two fp32 moments.
+The state contains no parameter-sized fp32 tensor when both representations are
+active.
+
+The included GPT-2-layer-shaped memory profile measures:
+
+| Configuration | Persistent bytes | vs AdamW |
+| --- | ---: | ---: |
+| AdamW | 56,641,572 | 1.000× |
+| TurboAdam, UState only | 30,320,712 | 0.535× |
+| TurboAdam, 1Q only | 32,090,112 | 0.567× |
+| **TurboAdam, UState + 1Q** | **5,769,288** | **0.102×** |
+
+### Convergence
+
+Matched 500-step GPT-2 124M runs use seed 42, sequence length 512, effective
+batch size 16, no AMP, 100 linear warmup steps, and cosine decay to zero. The
+TinyStories cache contains 12,000 chunks, so the run consumes 8,000 chunks
+without repeating data.
+
+| Dataset | AdamW final | TurboAdam final | Final gap | Trailing-50 gap |
+| --- | ---: | ---: | ---: | ---: |
+| TinyStories | 1.654943 | 1.675204 | +1.224% | +1.138% |
+| WikiText-103 | 3.291123 | 3.288014 | -0.094% | -0.013% |
+
+The TinyStories isolation identifies UState as the source of its late gap.
+UState with exact fp32 second moments retains a +1.229% final gap. Exact fp32
+first moments with 1Q finish within -0.060% of AdamW. Each result is a matched
+single-seed trajectory, not a multi-seed estimate.
 
 ### Speed
 
-Measured on one GPT-2 layer, RTX 4070, 200-step average.
+On an RTX 4070 Laptop GPU, the included GPT-2-layer optimizer benchmark measures
+6.26 ms per fused TurboAdam step and 2.23 ms per AdamW step.
 
-| Configuration | Time/step | vs AdamW |
-|--------------|-----------|----------|
-| AdamW (baseline) | 12.0 ms | 1.00× |
-| TurboAdam (v only) | 8.4 ms | **0.70×** |
-| TurboAdam (m + v, default) | 17.0 ms | **1.41×** |
-
-The v-only path is actually **faster** than AdamW because 4-bit log-scale decompression is cheaper than full fp32 EMA updates on small tensors. The m+v path adds ~40% overhead from CoState encode/decode.
-
-### Convergence: GPT-2 124M on WikiText-103
-
-| Configuration | Loss @ step 500 | Gap vs AdamW |
-|--------------|-----------------|--------------|
-| AdamW (full fp32) | 19.28 | — |
-| TurboAdam (8-bit v + CoState) | 19.79 | +0.51 |
-| **TurboAdam (4-bit v + CoState, default)** | **19.58** | **+0.25** |
-| TurboAdam (CoState only, fp32 v) | 19.80 | +0.52 |
-| TurboAdam (v only, fp32 m) | 19.28 | ~0.00 |
-
-The +0.25 gap is attributed to CoState's compressed-m representation. It has two sources that were not isolated in the experiments: (1) sign-only residual encoding, and (2) gradient-basis reuse: the residual is decoded against the *current* gradient, so reconstruction also absorbs `α·(g_{t+1} − g_t)`. The gap shrinks as training progresses (+2.94 at step 50, +0.25 at step 500). Threshold tuning and error feedback do not reduce it. For workloads where every tenth of a point matters, run with `compress_m=False` for v-only compression at zero convergence cost.
+The matched end-to-end language-model runs measure a 1.094× training-time ratio
+on both TinyStories and WikiText-103 because model computation dominates the
+optimizer step.
 
 ---
 
@@ -143,83 +239,109 @@ The +0.25 gap is attributed to CoState's compressed-m representation. It has two
 
 ```python
 TurboAdam(
-    params,                    # iterable of parameters or param groups
-    lr=1e-3,                   # learning rate
-    betas=(0.9, 0.999),        # (β₁, β₂) EMA decay coefficients
-    eps=1e-8,                  # numerical stability
-    weight_decay=0.0,          # AdamW-style decoupled weight decay
-    block_size=128,            # quantization block size (elements)
-    v_bits=4,                  # bits per element for v: 2, 3, 4, 6, or 8
-    compress_m=True,           # enable CoState m compression
-    compress_v=True,           # enable v compression
-    null_pct=0.10,             # CoState null threshold percentile
-    amp_pct=0.90,              # CoState amplitude threshold percentile
-    error_feedback=False,      # CoState error feedback (tested, no improvement)
-    capturable=False,          # CUDA graph capture (not yet supported)
-    min_m_compress_elements=4096,  # minimum param size for CoState m compression
+    params,                         # parameters or parameter groups
+    lr=1e-3,                        # learning rate
+    betas=(0.9, 0.999),             # AdamW EMA coefficients
+    eps=1e-8,                       # numerical stability
+    weight_decay=0.0,               # decoupled weight decay
+    block_size=128,                 # UState and 1Q storage block size
+    v_bits=4,                       # 1Q bits: 2, 3, 4, 6, or 8
+    compress_m=True,                # enable UState
+    compress_v=True,                # enable 1Q
+    capturable=False,               # CUDA graph capture is unsupported
+    min_m_compress_elements=4096,   # UState size threshold
+    min_v_compress_elements=4096,   # 1Q size threshold
+    m_block_size=64,                # UState mean block size
+    m_step_factor=1.1,              # UState scale factor
+    rounding_seed=0x12345678,       # counter-based rounding seed
 )
 ```
 
-All arguments are standard PyTorch Optimizer kwargs plus TurboAdam-specific compression controls. State dicts are fully compatible with `torch.save` / `torch.load`.
+The standard AdamW arguments retain their usual meaning. Parameters smaller
+than a representation's threshold use exact fp32 state for that moment. Set a
+threshold to zero to force compression for every nonempty parameter.
 
-**Notes:**
-- `torch.compile` will graph-break at `opt.step()` (expected for Python-loop optimizers; does not affect correctness).
-- FSDP / DeepSpeed ZeRO compatibility is on the [roadmap](ROADMAP.md) for v0.2.0.
+### Checkpoints
+
+`state_dict()` contains tensors and ordinary Python values. Loading preserves
+packed code dtypes even when parameters use fp16 or bf16. The rounding seed and
+per-parameter step counters are part of the optimizer configuration and state.
+
+Packed tensors restore exactly. CPU continuation is bit exact under the same
+gradients. CUDA continuation is numerically equivalent within fp32 roundoff
+from its parallel UState scale reduction.
 
 ---
 
-## Validation
+## Reproduce the results
+
+Build fixed GPT-2 token caches for both required datasets:
 
 ```bash
-# Full test suite (151 tests)
-python -m pytest tests/ -q
+python experiments/prepare_language_data.py \
+  --dataset tinystories \
+  --output data/tinystories_gpt2_seq512.pt
 
-# Quick convergence smoke test
-python -c "
-import torch, torch.nn as nn
-from turboadam import TurboAdam
+python experiments/prepare_language_data.py \
+  --dataset wikitext103 \
+  --output data/wikitext103_gpt2_seq512.pt
+```
 
-torch.manual_seed(0)
-x = nn.Parameter(torch.randn(50, device='cuda'))
-opt = TurboAdam([x], lr=1e-2)
-for _ in range(200):
-    opt.zero_grad()
-    loss = (x**2).sum()
-    loss.backward()
-    opt.step()
-print(f'Final loss: {loss.item():.6f}')  # < 5% of initial
-"
+Run AdamW and TurboAdam through the same trainer:
 
-# GPT-2 124M training run (~36 min on RTX 4070)
-python experiments/train_turboadam.py --steps 500 --log_every 50
+```bash
+python experiments/train_language_model.py \
+  --optimizer adamw \
+  --dataset tinystories \
+  --cache-path data/tinystories_gpt2_seq512.pt \
+  --output runs/tinystories_adamw.jsonl
 
-# Speed benchmark
-python scripts/benchmark_speed.py
+python experiments/train_language_model.py \
+  --optimizer turboadam \
+  --dataset tinystories \
+  --cache-path data/tinystories_gpt2_seq512.pt \
+  --output runs/tinystories_turboadam.jsonl
+```
 
-# Memory profiler
-python scripts/profile_memory.py
+Repeat with `--dataset wikitext103` and its cache. The runner records the cache
+SHA-256, model, seed, schedule, batch configuration, objective, state controls,
+loss, trailing loss, gradient norm, and elapsed time. It passes
+`labels=input_ids` to GPT-2 for the standard causal objective and logs the
+unscaled mean cross-entropy.
+
+Compare a matched pair with:
+
+```bash
+python scripts/compare_language_runs.py \
+  --adamw runs/tinystories_adamw.jsonl \
+  --turboadam runs/tinystories_turboadam.jsonl
 ```
 
 ---
 
-## Design decisions
+## Verification
 
-1. **Compress-every-step (not freeze-refresh).** The original design froze v for 1000 steps and refreshed periodically. This caused a +3.75 loss gap from v staleness. Compress-every-step with stochastic rounding eliminates staleness: the EMA runs continuously on the compressed state.
+```bash
+ruff format --check src tests experiments scripts benchmarks
+ruff check src tests experiments scripts benchmarks
+pytest -q
+```
 
-2. **4-bit default.** 4-bit gives 6.5× compression with +0.25 gap. 8-bit gives 4.1× with +0.51. The sweet spot is 4-bit: going higher barely improves precision, going lower risks noise accumulation.
+The suite covers the exact uncompressed AdamW identity, UState, 1Q, optimizer
+state, checkpoint continuation, memory accounting, language-runner semantics,
+and training smoke behavior.
 
-3. **Stochastic rounding.** Unbiased rounding prevents systematic drift in the EMA. Without it, deterministic rounding accumulates a bias of ~1000× the per-step error (for β₂=0.999).
-
-4. **Sign-only for CoState (not low-rank).** We tested LoRA-Pre style low-rank projection (rank 8–512). It fails for Adam because momentum is NOT low-rank: rank-8 captures only 4% of energy. Sign-only encoding captures direction for ALL elements, which is what Adam's per-coordinate denominator normalization needs.
-
-5. **P10/P90 thresholds.** Extensive testing showed threshold changes (P5/P85, P5/P80, P10/P95, etc.) produce identical convergence. The gap is structural to sign encoding, not the null/phase/amplitude split.
+The CUDA tests force both the PyTorch reference and Triton paths, compile every
+supported 1Q width, verify parameter and decoded-state agreement, exercise
+fp16, bf16, and fp32 parameters, check checkpoint restoration and continuation
+within the documented device guarantees, and measure the persistent state.
 
 ---
 
-## Project status
+## Limits
 
-- **Phase 1** (current): RTX 4070 8GB, models ≤ 125M, **complete**. Correctness validated, speed optimized, Triton kernels production-ready.
-- **Phase 2** (next): DGX Spark 128GB, models up to 7B, pending hardware.
+TurboAdam does not support sparse gradients, complex parameters, AMSGrad, or
+CUDA graph capture. Noncontiguous parameters use the PyTorch reference path.
 
 ---
 
@@ -227,10 +349,10 @@ python scripts/profile_memory.py
 
 ```bibtex
 @misc{kogan2026turboadam,
-  title={TurboAdam: Memory-Efficient Adam via In-Place Optimizer State Compression},
+  title={TurboAdam: Memory-Efficient AdamW with Compressed Persistent State},
   author={Kogan, David},
   year={2026},
-  howpublished={\url{https://github.com/davidkogan/turboadam}}
+  howpublished={\url{https://github.com/davidkny22/turboadam}}
 }
 ```
 
